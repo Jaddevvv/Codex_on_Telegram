@@ -25,10 +25,14 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(bot.format_duration(60), "1h")
         self.assertEqual(bot.format_duration(1440), "1d")
 
-    def test_permission_aliases_cover_approval_and_bypass_modes(self):
-        self.assertEqual(bot.normalize_permission_mode("on-request"), "approve")
-        self.assertEqual(bot.normalize_permission_mode("never"), "bypass")
-        self.assertEqual(bot.normalize_permission_mode("danger-full-access"), "full")
+    def test_permission_choices_use_the_three_cli_numbers(self):
+        self.assertEqual(bot.normalize_permission_mode("1"), "ask")
+        self.assertEqual(bot.normalize_permission_mode("2"), "approve")
+        self.assertEqual(bot.normalize_permission_mode("3"), "full")
+
+    def test_numbered_choice_returns_the_selected_item(self):
+        self.assertEqual(bot.numbered_choice("2", ["low", "medium", "high"]), "medium")
+        self.assertIsNone(bot.numbered_choice("4", ["low", "medium", "high"]))
 
     def test_format_goal_handles_empty_goal(self):
         self.assertIn("No goal is set", bot.format_goal(None))
@@ -104,7 +108,7 @@ class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
                 "sandboxPolicy": {"type": "dangerFullAccess"},
             },
         )
-        self.assertEqual(server.permission_summary().split(":", 1)[0], "full")
+        self.assertEqual(server.permission_summary(), "3. Full Access")
 
     async def test_compact_and_goal_use_current_thread(self):
         server = bot.CodexAppServer()
