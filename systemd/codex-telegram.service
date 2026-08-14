@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex on Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace both paths with the directory where you cloned this repository.
+WorkingDirectory=/home/YOUR_USER/Codex_on_Telegram
+ExecStart=/home/YOUR_USER/Codex_on_Telegram/run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
