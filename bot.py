@@ -2,9 +2,11 @@
 """Private Telegram bridge for the Codex app server."""
 
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -22,6 +24,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.log"))
 TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+OPENAI_CITATION_RE = re.compile(r"cite((?:[^]+)+)")
 
 PERMISSION_MODES = {
     "ask": {
@@ -94,6 +97,82 @@ async def telegram(method, values=None, timeout=70):
     )
 
 
+def clean_telegram_text(text, citation_sources=None):
+    """Turn Codex citation markers into links or remove unresolved markers."""
+    citation_sources = citation_sources or {}
+
+    def replace_citation(match):
+        references = re.findall(r"([^]+)", match.group(1))
+        links = []
+        for reference in references:
+            source = citation_sources.get(reference)
+            url = source.get("url") if source else None
+            if not url:
+                continue
+
+            title = source.get("title") or f"Source {len(links) + 1}"
+            title = " ".join(str(title).split()).replace("[", "(").replace("]", ")")
+            title = title[:80] or f"Source {len(links) + 1}"
+            links.append(f"[{title}]({url})")
+
+        return " ".join(links)
+
+    text = OPENAI_CITATION_RE.sub(replace_citation, text or "")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def telegram_html(text, citation_sources=None):
+    """Convert the small Markdown subset used by Codex into Telegram HTML."""
+    text = clean_telegram_text(text, citation_sources)
+    if not text:
+        return html.escape("(Codex returned an empty response.)")
+
+    protected = []
+
+    def protect(value):
+        marker = f"\x00{len(protected)}\x00"
+        protected.append(value)
+        return marker
+
+    def protect_fenced_code(match):
+        code = match.group(1)
+        return protect(f"<pre>{html.escape(code, quote=False)}</pre>")
+
+    text = re.sub(
+        r"```[^\n]*\n?(.*?)```",
+        protect_fenced_code,
+        text,
+        flags=re.DOTALL,
+    )
+
+    def protect_inline_code(match):
+        return protect(f"<code>{html.escape(match.group(1), quote=False)}</code>")
+
+    text = re.sub(r"`([^`\n]+)`", protect_inline_code, text)
+
+    def protect_link(match):
+        label = html.escape(match.group(1), quote=False)
+        url = html.escape(match.group(2), quote=True)
+        return protect(f'<a href="{url}">{label}</a>')
+
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", protect_link, text)
+    text = html.escape(text, quote=False)
+
+    # Apply emphasis after escaping user text so literal HTML can never become
+    # an executable Telegram tag.
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"~~([^~\n]+)~~", r"<s>\1</s>", text)
+
+    for index, value in enumerate(protected):
+        text = text.replace(f"\x00{index}\x00", value)
+    return text
+
+
 def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
     """Split text into non-empty Telegram-safe chunks without losing content."""
     if limit < 1:
@@ -103,27 +182,32 @@ def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
     return [text[start:start + limit] for start in range(0, len(text), limit)]
 
 
-async def send_message(chat_id, text):
+async def send_message(chat_id, text, citation_sources=None):
     sent = []
 
-    for chunk in split_message(text):
+    for chunk in split_message(clean_telegram_text(text, citation_sources)):
         sent.append(await telegram(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": chunk,
+                "text": telegram_html(chunk, citation_sources),
+                "parse_mode": "HTML",
             },
         ))
     return sent
 
 
-async def edit_message(chat_id, message_id, text):
+async def edit_message(chat_id, message_id, text, citation_sources=None):
     return await telegram(
         "editMessageText",
         {
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": text[:4000],
+            "text": telegram_html(
+                clean_telegram_text(text, citation_sources)[:TELEGRAM_MESSAGE_LIMIT],
+                citation_sources,
+            ),
+            "parse_mode": "HTML",
         },
     )
 
@@ -238,6 +322,7 @@ class CodexAppServer:
         self.current_effort = None
         self.permission_mode = normalize_permission_mode(DEFAULT_PERMISSION_MODE) or "approve"
         self.token_usage = None
+        self.citation_sources = {}
         self.active_turn_id = None
         self.last_event = "not started"
         self.last_event_at = None
@@ -252,6 +337,26 @@ class CodexAppServer:
     def progress(self, text):
         if text:
             self.progress_updates.put_nowait(text)
+
+    def record_citation_sources(self, value):
+        """Remember web-search result URLs referenced by final answer citations."""
+        if isinstance(value, dict):
+            reference = value.get("ref_id") or value.get("refId")
+            url = value.get("url")
+            if (
+                isinstance(reference, str)
+                and isinstance(url, str)
+                and url.startswith(("https://", "http://"))
+            ):
+                self.citation_sources[reference] = {
+                    "title": value.get("title") or reference,
+                    "url": url,
+                }
+            for child in value.values():
+                self.record_citation_sources(child)
+        elif isinstance(value, list):
+            for child in value:
+                self.record_citation_sources(child)
 
     async def respond(self, request_id, result=None, error=None):
         message = {"id": request_id}
@@ -379,6 +484,8 @@ class CodexAppServer:
                 elif method in {"item/started", "item/completed"}:
                     item = params.get("item", {})
                     item_type = item.get("type", "work")
+                    if method == "item/completed" and item_type == "webSearch":
+                        self.record_citation_sources(item)
                     if method == "item/started" and item_type != "agentMessage":
                         detail = item.get("command") or item.get("query") or item.get("name")
                         if isinstance(detail, list):
@@ -1098,7 +1205,11 @@ async def main():
                                 if update != last_update:
                                     text = f"Codex is working…\n\nLatest progress:\n{update}"
                                     if progress_message["id"] is None:
-                                        sent = await send_message(target_chat_id, text)
+                                        sent = await send_message(
+                                            target_chat_id,
+                                            text,
+                                            codex.citation_sources,
+                                        )
                                         if sent:
                                             progress_message["id"] = sent[0]["message_id"]
                                     else:
@@ -1107,6 +1218,7 @@ async def main():
                                                 target_chat_id,
                                                 progress_message["id"],
                                                 text,
+                                                codex.citation_sources,
                                             )
                                         except Exception as error:
                                             if "message is not modified" not in str(error).lower():
@@ -1116,7 +1228,11 @@ async def main():
                         progress_task = asyncio.create_task(report_progress())
                         try:
                             response = await codex.run(prompt)
-                            await send_message(target_chat_id, response)
+                            await send_message(
+                                target_chat_id,
+                                response,
+                                codex.citation_sources,
+                            )
                         except Exception as error:
                             await send_message(
                                 target_chat_id,
