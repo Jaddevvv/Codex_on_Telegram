@@ -17,10 +17,59 @@ ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 CODEX_BIN = os.environ.get("CODEX_BIN", "/root/.local/bin/codex")
 WORKSPACE = os.environ.get("CODEX_WORKSPACE", str(Path.home() / "codex-workspace"))
 DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "medium")
+DEFAULT_PERMISSION_MODE = os.environ.get("CODEX_PERMISSION_MODE", "bypass")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.log"))
 TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+
+PERMISSION_MODES = {
+    "approve": {
+        "label": "Approve requests automatically (on-request)",
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+        "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": True},
+    },
+    "bypass": {
+        "label": "Bypass approval prompts (never, workspace write)",
+        "approvalPolicy": "never",
+        "sandbox": "workspace-write",
+        "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": True},
+    },
+    "readonly": {
+        "label": "Read-only workspace",
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "sandboxPolicy": {"type": "readOnly", "networkAccess": True},
+    },
+    "full": {
+        "label": "Full machine access (danger-full-access)",
+        "approvalPolicy": "never",
+        "sandbox": "danger-full-access",
+        "sandboxPolicy": {"type": "dangerFullAccess"},
+    },
+}
+
+PERMISSION_ALIASES = {
+    "approve": "approve",
+    "ask": "approve",
+    "on-request": "approve",
+    "on_request": "approve",
+    "bypass": "bypass",
+    "never": "bypass",
+    "workspace": "bypass",
+    "workspace-write": "bypass",
+    "workspace_write": "bypass",
+    "readonly": "readonly",
+    "read-only": "readonly",
+    "read_only": "readonly",
+    "read": "readonly",
+    "full": "full",
+    "all": "full",
+    "danger": "full",
+    "danger-full-access": "full",
+    "danger_full_access": "full",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,6 +206,27 @@ def format_reset(timestamp):
     return reset.strftime("%Y-%m-%d %H:%M UTC")
 
 
+def normalize_permission_mode(value):
+    normalized = str(value or "").strip().lower()
+    return PERMISSION_ALIASES.get(normalized)
+
+
+def format_goal(goal):
+    if not goal:
+        return "No goal is set for this conversation.\n\nSet one with: /goal OBJECTIVE"
+
+    objective = goal.get("objective") or "(no objective)"
+    status = goal.get("status", "unknown")
+    tokens = goal.get("tokensUsed")
+    token_budget = goal.get("tokenBudget")
+    usage = ""
+    if isinstance(tokens, int):
+        usage = f"\nTokens: {tokens:,}"
+        if isinstance(token_budget, int):
+            usage += f" / {token_budget:,}"
+    return f"Goal ({status}):\n{objective}{usage}"
+
+
 class CodexAppServer:
     def __init__(self):
         self.process = None
@@ -170,6 +240,8 @@ class CodexAppServer:
         self.models = []
         self.current_model = None
         self.current_effort = None
+        self.permission_mode = normalize_permission_mode(DEFAULT_PERMISSION_MODE) or "bypass"
+        self.permission_profile = None
         self.token_usage = None
         self.active_turn_id = None
         self.last_event = "not started"
@@ -306,6 +378,9 @@ class CodexAppServer:
                     if not params.get("threadId") or params.get("threadId") == self.thread_id:
                         self.token_usage = params
 
+                elif method == "thread/compacted":
+                    self.progress("Context compacted")
+
                 elif method in {"item/started", "item/completed"}:
                     item = params.get("item", {})
                     item_type = item.get("type", "work")
@@ -398,18 +473,115 @@ class CodexAppServer:
         ]
 
     async def new_thread(self):
-        result = await self.request(
-            "thread/start",
-            {
-                "model": self.current_model,
-                "cwd": WORKSPACE,
-                "approvalPolicy": "never",
-                "sandbox": "workspace-write",
-                "serviceName": "telegram_codex_bot",
-            },
-        )
+        params = {
+            "model": self.current_model,
+            "cwd": WORKSPACE,
+            "serviceName": "telegram_codex_bot",
+        }
+        params.update(self.thread_permission_params())
+        result = await self.request("thread/start", params)
         self.thread_id = result["thread"]["id"]
         self.token_usage = None
+
+    def thread_permission_params(self):
+        if self.permission_profile:
+            return {"permissions": self.permission_profile}
+        mode = PERMISSION_MODES[self.permission_mode]
+        return {
+            "approvalPolicy": mode["approvalPolicy"],
+            "sandbox": mode["sandbox"],
+        }
+
+    def turn_permission_params(self):
+        if self.permission_profile:
+            return {"permissions": self.permission_profile}
+        mode = PERMISSION_MODES[self.permission_mode]
+        return {
+            "approvalPolicy": mode["approvalPolicy"],
+            "sandboxPolicy": dict(mode["sandboxPolicy"]),
+        }
+
+    def permission_summary(self):
+        if self.permission_profile:
+            return f"profile {self.permission_profile}"
+        mode = PERMISSION_MODES[self.permission_mode]
+        return f"{self.permission_mode}: {mode['label']}"
+
+    async def list_permission_profiles(self):
+        result = await self.request(
+            "permissionProfile/list",
+            {"cwd": WORKSPACE, "limit": 100},
+        )
+        return result.get("data", [])
+
+    async def set_permission_mode(self, mode):
+        if mode not in PERMISSION_MODES:
+            raise ValueError(f"Unknown permission mode: {mode}")
+        self.permission_mode = mode
+        self.permission_profile = None
+        if not self.thread_id:
+            return
+        try:
+            await self.request(
+                "thread/settings/update",
+                {
+                    "permissions": None,
+                    "approvalPolicy": PERMISSION_MODES[mode]["approvalPolicy"],
+                    "sandboxPolicy": PERMISSION_MODES[mode]["sandboxPolicy"],
+                },
+            )
+        except Exception as error:
+            LOG.warning("Could not update thread permissions immediately: %s", error)
+
+    async def set_permission_profile(self, profile_id):
+        self.permission_profile = profile_id
+        if not self.thread_id:
+            return
+        try:
+            await self.request(
+                "thread/settings/update",
+                {"permissions": profile_id, "sandboxPolicy": None},
+            )
+        except Exception as error:
+            LOG.warning("Could not update permission profile immediately: %s", error)
+
+    async def compact_thread(self):
+        if not self.thread_id:
+            raise RuntimeError("No Codex conversation is active")
+        return await self.request(
+            "thread/compact/start",
+            {"threadId": self.thread_id},
+        )
+
+    async def get_goal(self):
+        if not self.thread_id:
+            raise RuntimeError("No Codex conversation is active")
+        result = await self.request(
+            "thread/goal/get",
+            {"threadId": self.thread_id},
+        )
+        return result.get("goal")
+
+    async def set_goal(self, objective, status="active"):
+        if not self.thread_id:
+            raise RuntimeError("No Codex conversation is active")
+        result = await self.request(
+            "thread/goal/set",
+            {
+                "threadId": self.thread_id,
+                "objective": objective,
+                "status": status,
+            },
+        )
+        return result.get("goal")
+
+    async def clear_goal(self):
+        if not self.thread_id:
+            raise RuntimeError("No Codex conversation is active")
+        return await self.request(
+            "thread/goal/clear",
+            {"threadId": self.thread_id},
+        )
 
     async def list_threads(self, limit=10):
         result = await self.request(
@@ -436,22 +608,17 @@ class CodexAppServer:
         return thread
 
     async def run(self, prompt):
-        result = await self.request(
-            "turn/start",
-            {
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": prompt}],
-                "cwd": WORKSPACE,
-                "approvalPolicy": "never",
-                "sandboxPolicy": {
-                    "type": "workspaceWrite",
-                    "writableRoots": [WORKSPACE],
-                    "networkAccess": True,
-                },
-                "model": self.current_model,
-                "effort": self.current_effort,
-            },
-        )
+        params = {
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "cwd": WORKSPACE,
+            "model": self.current_model,
+            "effort": self.current_effort,
+        }
+        params.update(self.turn_permission_params())
+        if not self.permission_profile and self.permission_mode in {"approve", "bypass"}:
+            params["sandboxPolicy"]["writableRoots"] = [WORKSPACE]
+        result = await self.request("turn/start", params)
 
         turn_id = result["turn"]["id"]
         self.active_turn_id = turn_id
@@ -528,6 +695,7 @@ class CodexAppServer:
         lines = [
             f"Model: {self.current_model}",
             f"Thinking: {self.current_effort or 'default'}",
+            f"Permissions: {self.permission_summary()}",
             f"Task running: {'yes' if self.active_turn_id else 'no'}",
             f"Last event: {self.last_event} ({event_age})",
             self.context_status(),
@@ -599,6 +767,7 @@ async def main():
                     parts = text.strip().split()
                     command = parts[0].split("@")[0].lower() if parts else ""
                     argument = parts[1] if len(parts) > 1 else None
+                    argument_text = " ".join(parts[1:])
 
                     if command in ("/start", "/help"):
                         await send_message(
@@ -608,12 +777,129 @@ async def main():
                             "/model MODEL_ID — select a model\n"
                             "/think — list thinking levels\n"
                             "/think LEVEL — select a thinking level\n"
+                            "/permissions — show approval and sandbox modes\n"
+                            "/permissions MODE — set approve, bypass, read-only, or full\n"
+                            "/compact — compact the current context\n"
+                            "/goal — show the current goal\n"
+                            "/goal OBJECTIVE — set a durable goal\n"
+                            "/goal clear — remove the current goal\n"
                             "/status or /debug — live task and last event\n"
                             "/stop — stop the current task\n"
                             "/resume — list recent conversations\n"
                             "/resume NUMBER — resume a listed conversation\n"
                             "/new — start a fresh conversation",
                         )
+                        continue
+
+                    if command in {"/permissions", "/permission"}:
+                        if running_task and not running_task.done():
+                            await send_message(chat_id, "Stop the current task before changing permissions.")
+                            continue
+
+                        requested_mode = normalize_permission_mode(argument_text)
+                        if not argument_text or argument_text.lower() in {"list", "status"}:
+                            lines = [
+                                f"Current permissions: {codex.permission_summary()}",
+                                "",
+                                "Built-in modes:",
+                            ]
+                            for mode_name, mode in PERMISSION_MODES.items():
+                                marker = " ✓" if not codex.permission_profile and mode_name == codex.permission_mode else ""
+                                lines.append(f"{mode_name}{marker} — {mode['label']}")
+                            try:
+                                profiles = await codex.list_permission_profiles()
+                            except Exception:
+                                profiles = []
+                            if profiles:
+                                lines.extend(["", "Configured profiles:"])
+                                for profile in profiles:
+                                    allowed = "" if profile.get("allowed", True) else " (not allowed)"
+                                    lines.append(f"{profile.get('id')}{allowed}")
+                            lines.append("\nChoose with: /permissions MODE")
+                            await send_message(chat_id, "\n".join(lines))
+                            continue
+
+                        if requested_mode:
+                            await codex.set_permission_mode(requested_mode)
+                            await send_message(
+                                chat_id,
+                                f"Permissions set to {codex.permission_summary()}. Applies to the next turn.",
+                            )
+                            continue
+
+                        try:
+                            profiles = await codex.list_permission_profiles()
+                        except Exception:
+                            profiles = []
+                        selected_profile = next(
+                            (
+                                profile
+                                for profile in profiles
+                                if profile.get("id") == argument_text and profile.get("allowed", True)
+                            ),
+                            None,
+                        )
+                        if selected_profile:
+                            await codex.set_permission_profile(selected_profile["id"])
+                            await send_message(
+                                chat_id,
+                                f"Permissions set to profile {selected_profile['id']}. Applies to the next turn.",
+                            )
+                        else:
+                            await send_message(
+                                chat_id,
+                                "Unknown permissions mode. Send /permissions to list valid modes.",
+                            )
+                        continue
+
+                    if command in {"/compact", "/compact_context"}:
+                        if running_task and not running_task.done():
+                            await send_message(chat_id, "Stop the current task before compacting context.")
+                            continue
+                        await send_message(chat_id, "Compacting the current context...")
+                        try:
+                            await codex.compact_thread()
+                            await send_message(chat_id, "Context compacted.")
+                        except Exception as error:
+                            await send_message(chat_id, f"Could not compact context: {error}")
+                        continue
+
+                    if command in {"/goal", "/goals"}:
+                        if running_task and not running_task.done():
+                            await send_message(chat_id, "Stop the current task before changing its goal.")
+                            continue
+                        goal_argument = argument_text.strip()
+                        try:
+                            if not goal_argument or goal_argument.lower() in {"status", "show"}:
+                                await send_message(chat_id, format_goal(await codex.get_goal()))
+                            elif goal_argument.lower() in {"clear", "delete", "off", "none"}:
+                                await codex.clear_goal()
+                                await send_message(chat_id, "Goal cleared.")
+                            else:
+                                normalized_status = goal_argument.lower().replace("-", "").replace("_", "")
+                                status_aliases = {
+                                    "active": "active",
+                                    "paused": "paused",
+                                    "blocked": "blocked",
+                                    "usagelimited": "usageLimited",
+                                    "budgetlimited": "budgetLimited",
+                                    "complete": "complete",
+                                }
+                                if normalized_status in status_aliases:
+                                    current_goal = await codex.get_goal()
+                                    if not current_goal:
+                                        await send_message(chat_id, "No goal is set. Use /goal OBJECTIVE first.")
+                                    else:
+                                        goal = await codex.set_goal(
+                                            current_goal["objective"],
+                                            status_aliases[normalized_status],
+                                        )
+                                        await send_message(chat_id, format_goal(goal))
+                                else:
+                                    goal = await codex.set_goal(goal_argument)
+                                    await send_message(chat_id, format_goal(goal))
+                        except Exception as error:
+                            await send_message(chat_id, f"Could not update goal: {error}")
                         continue
 
                     if command == "/model":
