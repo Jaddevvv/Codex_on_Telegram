@@ -19,6 +19,8 @@ WORKSPACE = os.environ.get("CODEX_WORKSPACE", str(Path.home() / "codex-workspace
 DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "medium")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.log"))
+TELEGRAM_MESSAGE_LIMIT = 4000
+APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,16 +57,24 @@ async def telegram(method, values=None, timeout=70):
     )
 
 
-async def send_message(chat_id, text):
+def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
+    """Split text into non-empty Telegram-safe chunks without losing content."""
+    if limit < 1:
+        raise ValueError("Message chunk limit must be positive")
+
     text = text or "(Codex returned an empty response.)"
+    return [text[start:start + limit] for start in range(0, len(text), limit)]
+
+
+async def send_message(chat_id, text):
     sent = []
 
-    for start in range(0, len(text), 4000):
+    for chunk in split_message(text):
         sent.append(await telegram(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": text[start:start + 4000],
+                "text": chunk,
             },
         ))
     return sent
@@ -193,6 +203,7 @@ class CodexAppServer:
             stdout=asyncio.subprocess.PIPE,
             stderr=None,
             cwd=WORKSPACE,
+            limit=APP_SERVER_STREAM_LIMIT,
         )
         self.reader_task = asyncio.create_task(self.read_messages())
 

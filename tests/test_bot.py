@@ -27,6 +27,18 @@ class FormattingTests(unittest.TestCase):
 
 
 class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
+    def test_split_message_hard_splits_without_separators(self):
+        text = "x" * 10_001
+
+        chunks = bot.split_message(text, limit=4000)
+
+        self.assertEqual([len(chunk) for chunk in chunks], [4000, 4000, 2001])
+        self.assertEqual("".join(chunks), text)
+
+    def test_split_message_rejects_invalid_limit(self):
+        with self.assertRaises(ValueError):
+            bot.split_message("text", limit=0)
+
     async def test_send_message_splits_long_text(self):
         with patch.object(bot, "telegram", new=AsyncMock(side_effect=[{"message_id": 1}, {"message_id": 2}])) as request:
             sent = await bot.send_message(123, "x" * 4001)
