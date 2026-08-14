@@ -56,15 +56,14 @@ Start the bridge:
 | Command | Action |
 | --- | --- |
 | `/start`, `/help` | Show the command reference. |
-| `/model` | List models and show the selected model. |
+| `/model` | List numbered models; reply with a number to select one. |
 | `/model MODEL_ID` | Select a model for subsequent turns. |
-| `/think` | List reasoning levels supported by the selected model. |
+| `/think` | List numbered reasoning levels; reply with a number to select one. |
 | `/think LEVEL` | Select a reasoning level for subsequent turns. |
-| `/permissions` | List the approval/sandbox modes and configured permission profiles. |
-| `/permissions approve` | Use on-request approvals; the Telegram bridge accepts approval prompts for you. |
-| `/permissions bypass` | Skip approval prompts with workspace-write access. This is the default. |
-| `/permissions read-only` | Restrict the Codex sandbox to read-only access. |
-| `/permissions full` | Enable `danger-full-access`; use only when you explicitly want full machine access. |
+| `/permissions` | List the three numbered Codex permission choices; reply with a number to select one. |
+| `/permissions 1` | Ask for approval. |
+| `/permissions 2` | Approve for me (the default). |
+| `/permissions 3` | Full Access. |
 | `/compact` | Compact the current Codex context. |
 | `/goal` | Show the current durable goal. |
 | `/goal OBJECTIVE` | Set or replace the current durable goal. |
@@ -76,7 +75,7 @@ Start the bridge:
 | `/resume` | List recent conversations. |
 | `/resume NUMBER` | Resume a listed conversation. |
 
-Any other text starts a Codex turn. Only one turn runs at a time.
+If a numbered menu is active, the next message is used as that selection. Otherwise, any other text starts a Codex turn. Only one turn runs at a time.
 
 ## Configuration
 
@@ -87,7 +86,7 @@ Any other text starts a Codex turn. Only one turn runs at a time.
 | `CODEX_BIN` | No | `/root/.local/bin/codex` | Path to the Codex executable. |
 | `CODEX_WORKSPACE` | No | `~/codex-workspace` | Working directory and writable root provided to Codex. |
 | `CODEX_DEFAULT_EFFORT` | No | `medium` | Preferred reasoning effort when supported by the model. |
-| `CODEX_PERMISSION_MODE` | No | `bypass` | Initial mode: `approve`, `bypass`, `read-only`, or `full`. |
+| `CODEX_PERMISSION_MODE` | No | `approve` | Initial mode: `1` (ask), `2` (approve for me), or `3` (full access). |
 | `CODEX_EVENT_LOG` | No | `/root/codex-telegram/events.log` | Private app-server event log path. |
 
 Restart the bridge after changing `.env`.
@@ -119,7 +118,7 @@ This bridge can allow Codex to edit files and run commands in `CODEX_WORKSPACE`.
 - Use a private one-to-one Telegram chat.
 - Run the service as an unprivileged OS user.
 - Limit `CODEX_WORKSPACE` to the projects the bot should access.
-- Keep the default `bypass` mode scoped to `CODEX_WORKSPACE`; choose `full` only for a deliberate, temporary need.
+- Keep the default approve-for-me mode scoped to `CODEX_WORKSPACE`; choose full access only for a deliberate, temporary need.
 - Revoke the BotFather token immediately if it is exposed.
 - The app-server integration accepts supported approval requests for the active session, so treat Telegram access as remote shell-adjacent access.
 

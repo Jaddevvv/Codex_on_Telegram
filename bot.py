@@ -17,33 +17,33 @@ ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 CODEX_BIN = os.environ.get("CODEX_BIN", "/root/.local/bin/codex")
 WORKSPACE = os.environ.get("CODEX_WORKSPACE", str(Path.home() / "codex-workspace"))
 DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "medium")
-DEFAULT_PERMISSION_MODE = os.environ.get("CODEX_PERMISSION_MODE", "bypass")
+DEFAULT_PERMISSION_MODE = os.environ.get("CODEX_PERMISSION_MODE", "approve")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.log"))
 TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 
 PERMISSION_MODES = {
-    "approve": {
-        "label": "Approve requests automatically (on-request)",
+    "ask": {
+        "number": "1",
+        "label": "Ask for approval",
+        "description": "Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files.",
         "approvalPolicy": "on-request",
         "sandbox": "workspace-write",
-        "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": True},
+        "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": False},
     },
-    "bypass": {
-        "label": "Bypass approval prompts (never, workspace write)",
+    "approve": {
+        "number": "2",
+        "label": "Approve for me",
+        "description": "Only ask for actions detected as potentially unsafe.",
         "approvalPolicy": "never",
         "sandbox": "workspace-write",
         "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": True},
     },
-    "readonly": {
-        "label": "Read-only workspace",
-        "approvalPolicy": "never",
-        "sandbox": "read-only",
-        "sandboxPolicy": {"type": "readOnly", "networkAccess": True},
-    },
     "full": {
-        "label": "Full machine access (danger-full-access)",
+        "number": "3",
+        "label": "Full Access",
+        "description": "Codex can edit files outside this workspace and access the internet without asking for approval. Exercise caution when using.",
         "approvalPolicy": "never",
         "sandbox": "danger-full-access",
         "sandboxPolicy": {"type": "dangerFullAccess"},
@@ -51,24 +51,12 @@ PERMISSION_MODES = {
 }
 
 PERMISSION_ALIASES = {
+    "1": "ask",
+    "2": "approve",
+    "3": "full",
+    "ask": "ask",
     "approve": "approve",
-    "ask": "approve",
-    "on-request": "approve",
-    "on_request": "approve",
-    "bypass": "bypass",
-    "never": "bypass",
-    "workspace": "bypass",
-    "workspace-write": "bypass",
-    "workspace_write": "bypass",
-    "readonly": "readonly",
-    "read-only": "readonly",
-    "read_only": "readonly",
-    "read": "readonly",
     "full": "full",
-    "all": "full",
-    "danger": "full",
-    "danger-full-access": "full",
-    "danger_full_access": "full",
 }
 
 logging.basicConfig(
@@ -211,6 +199,14 @@ def normalize_permission_mode(value):
     return PERMISSION_ALIASES.get(normalized)
 
 
+def numbered_choice(value, options):
+    try:
+        index = int(str(value).strip()) - 1
+    except (TypeError, ValueError):
+        return None
+    return options[index] if 0 <= index < len(options) else None
+
+
 def format_goal(goal):
     if not goal:
         return "No goal is set for this conversation.\n\nSet one with: /goal OBJECTIVE"
@@ -240,8 +236,7 @@ class CodexAppServer:
         self.models = []
         self.current_model = None
         self.current_effort = None
-        self.permission_mode = normalize_permission_mode(DEFAULT_PERMISSION_MODE) or "bypass"
-        self.permission_profile = None
+        self.permission_mode = normalize_permission_mode(DEFAULT_PERMISSION_MODE) or "approve"
         self.token_usage = None
         self.active_turn_id = None
         self.last_event = "not started"
@@ -484,8 +479,6 @@ class CodexAppServer:
         self.token_usage = None
 
     def thread_permission_params(self):
-        if self.permission_profile:
-            return {"permissions": self.permission_profile}
         mode = PERMISSION_MODES[self.permission_mode]
         return {
             "approvalPolicy": mode["approvalPolicy"],
@@ -493,8 +486,6 @@ class CodexAppServer:
         }
 
     def turn_permission_params(self):
-        if self.permission_profile:
-            return {"permissions": self.permission_profile}
         mode = PERMISSION_MODES[self.permission_mode]
         return {
             "approvalPolicy": mode["approvalPolicy"],
@@ -502,23 +493,13 @@ class CodexAppServer:
         }
 
     def permission_summary(self):
-        if self.permission_profile:
-            return f"profile {self.permission_profile}"
         mode = PERMISSION_MODES[self.permission_mode]
-        return f"{self.permission_mode}: {mode['label']}"
-
-    async def list_permission_profiles(self):
-        result = await self.request(
-            "permissionProfile/list",
-            {"cwd": WORKSPACE, "limit": 100},
-        )
-        return result.get("data", [])
+        return f"{mode['number']}. {mode['label']}"
 
     async def set_permission_mode(self, mode):
         if mode not in PERMISSION_MODES:
             raise ValueError(f"Unknown permission mode: {mode}")
         self.permission_mode = mode
-        self.permission_profile = None
         if not self.thread_id:
             return
         try:
@@ -532,18 +513,6 @@ class CodexAppServer:
             )
         except Exception as error:
             LOG.warning("Could not update thread permissions immediately: %s", error)
-
-    async def set_permission_profile(self, profile_id):
-        self.permission_profile = profile_id
-        if not self.thread_id:
-            return
-        try:
-            await self.request(
-                "thread/settings/update",
-                {"permissions": profile_id, "sandboxPolicy": None},
-            )
-        except Exception as error:
-            LOG.warning("Could not update permission profile immediately: %s", error)
 
     async def compact_thread(self):
         if not self.thread_id:
@@ -616,7 +585,7 @@ class CodexAppServer:
             "effort": self.current_effort,
         }
         params.update(self.turn_permission_params())
-        if not self.permission_profile and self.permission_mode in {"approve", "bypass"}:
+        if self.permission_mode in {"ask", "approve"}:
             params["sandboxPolicy"]["writableRoots"] = [WORKSPACE]
         result = await self.request("turn/start", params)
 
@@ -735,6 +704,7 @@ async def main():
     offset = 0
     codex = CodexAppServer()
     running_task = None
+    pending_selection = None
     await telegram("deleteWebhook", {"drop_pending_updates": "false"})
     await codex.start()
 
@@ -769,6 +739,72 @@ async def main():
                     argument = parts[1] if len(parts) > 1 else None
                     argument_text = " ".join(parts[1:])
 
+                    if command.startswith("/"):
+                        pending_selection = None
+                    elif pending_selection:
+                        selection = text.strip()
+                        pending = pending_selection
+                        pending_selection = None
+
+                        if pending["kind"] == "permissions":
+                            requested_mode = normalize_permission_mode(selection)
+                            if not requested_mode:
+                                await send_message(chat_id, "Choose 1, 2, or 3.")
+                            else:
+                                await codex.set_permission_mode(requested_mode)
+                                await send_message(
+                                    chat_id,
+                                    f"Permissions set to {codex.permission_summary()}. You can send your prompt now.",
+                                )
+                            continue
+
+                        if pending["kind"] == "thinking":
+                            selected_effort = numbered_choice(selection, pending["options"])
+                            if selected_effort is None:
+                                await send_message(chat_id, "Choose one of the numbered thinking levels.")
+                            else:
+                                codex.current_effort = selected_effort
+                                await send_message(
+                                    chat_id,
+                                    f"Thinking set to {selected_effort}. You can send your prompt now.",
+                                )
+                            continue
+
+                        if pending["kind"] == "model":
+                            selected = numbered_choice(selection, pending["options"])
+                            if selected is None:
+                                await send_message(chat_id, "Choose one of the numbered models.")
+                            else:
+                                codex.current_model = selected.get("model") or selected.get("id")
+                                supported = {
+                                    effort.get("reasoningEffort")
+                                    for effort in selected.get("supportedReasoningEfforts", [])
+                                }
+                                codex.current_effort = (
+                                    DEFAULT_REASONING_EFFORT
+                                    if DEFAULT_REASONING_EFFORT in supported
+                                    else selected.get("defaultReasoningEffort")
+                                )
+                                await send_message(
+                                    chat_id,
+                                    f"Model set to {codex.current_model}. You can send your prompt now.",
+                                )
+                            continue
+
+                        if pending["kind"] == "resume":
+                            selected_thread = numbered_choice(selection, pending["options"])
+                            if selected_thread is None:
+                                await send_message(chat_id, "Choose one of the numbered conversations.")
+                            else:
+                                try:
+                                    resumed = await codex.resume_thread(selected_thread["id"])
+                                except Exception as error:
+                                    await send_message(chat_id, f"Could not resume conversation: {error}")
+                                else:
+                                    title = resumed.get("name") or resumed.get("preview") or resumed["id"]
+                                    await send_message(chat_id, f"Resumed conversation:\n{title}")
+                            continue
+
                     if command in ("/start", "/help"):
                         await send_message(
                             chat_id,
@@ -777,8 +813,8 @@ async def main():
                             "/model MODEL_ID — select a model\n"
                             "/think — list thinking levels\n"
                             "/think LEVEL — select a thinking level\n"
-                            "/permissions — show approval and sandbox modes\n"
-                            "/permissions MODE — set approve, bypass, read-only, or full\n"
+                            "/permissions — show the three permission choices\n"
+                            "/permissions 1|2|3 — choose a permission mode\n"
                             "/compact — compact the current context\n"
                             "/goal — show the current goal\n"
                             "/goal OBJECTIVE — set a durable goal\n"
@@ -796,60 +832,31 @@ async def main():
                             await send_message(chat_id, "Stop the current task before changing permissions.")
                             continue
 
-                        requested_mode = normalize_permission_mode(argument_text)
-                        if not argument_text or argument_text.lower() in {"list", "status"}:
+                        if not argument_text:
+                            current = PERMISSION_MODES[codex.permission_mode]
                             lines = [
                                 f"Current permissions: {codex.permission_summary()}",
                                 "",
-                                "Built-in modes:",
                             ]
-                            for mode_name, mode in PERMISSION_MODES.items():
-                                marker = " ✓" if not codex.permission_profile and mode_name == codex.permission_mode else ""
-                                lines.append(f"{mode_name}{marker} — {mode['label']}")
-                            try:
-                                profiles = await codex.list_permission_profiles()
-                            except Exception:
-                                profiles = []
-                            if profiles:
-                                lines.extend(["", "Configured profiles:"])
-                                for profile in profiles:
-                                    allowed = "" if profile.get("allowed", True) else " (not allowed)"
-                                    lines.append(f"{profile.get('id')}{allowed}")
-                            lines.append("\nChoose with: /permissions MODE")
+                            for mode in PERMISSION_MODES.values():
+                                marker = " (current)" if mode["number"] == current["number"] else ""
+                                lines.append(f"{mode['number']}. {mode['label']}{marker}")
+                                lines.append(f"   {mode['description']}")
+                            lines.append("\nReply with 1, 2, or 3 to choose.")
+                            pending_selection = {"kind": "permissions"}
                             await send_message(chat_id, "\n".join(lines))
                             continue
 
+                        requested_mode = normalize_permission_mode(argument_text)
                         if requested_mode:
                             await codex.set_permission_mode(requested_mode)
                             await send_message(
                                 chat_id,
-                                f"Permissions set to {codex.permission_summary()}. Applies to the next turn.",
+                                f"Permissions set to {codex.permission_summary()}. You can send your prompt now.",
                             )
                             continue
 
-                        try:
-                            profiles = await codex.list_permission_profiles()
-                        except Exception:
-                            profiles = []
-                        selected_profile = next(
-                            (
-                                profile
-                                for profile in profiles
-                                if profile.get("id") == argument_text and profile.get("allowed", True)
-                            ),
-                            None,
-                        )
-                        if selected_profile:
-                            await codex.set_permission_profile(selected_profile["id"])
-                            await send_message(
-                                chat_id,
-                                f"Permissions set to profile {selected_profile['id']}. Applies to the next turn.",
-                            )
-                        else:
-                            await send_message(
-                                chat_id,
-                                "Unknown permissions mode. Send /permissions to list valid modes.",
-                            )
+                        await send_message(chat_id, "Choose 1, 2, or 3. Send /permissions to list the three choices.")
                         continue
 
                     if command in {"/compact", "/compact_context"}:
@@ -906,25 +913,28 @@ async def main():
                         await codex.refresh_models()
                         if not argument:
                             model_lines = []
-                            for model in codex.models:
+                            for index, model in enumerate(codex.models, 1):
                                 model_id = model.get("model") or model.get("id")
                                 marker = " ✓" if model_id == codex.current_model else ""
-                                model_lines.append(f"{model_id}{marker}")
+                                model_lines.append(f"{index}. {model_id}{marker}")
+                            pending_selection = {"kind": "model", "options": codex.models}
                             await send_message(
                                 chat_id,
                                 "Available models:\n" + "\n".join(model_lines)
-                                + "\n\nChoose with: /model MODEL_ID",
+                                + "\n\nReply with the model number to choose.",
                             )
                             continue
 
-                        selected = next(
-                            (
-                                model
-                                for model in codex.models
-                                if argument in (model.get("id"), model.get("model"))
-                            ),
-                            None,
-                        )
+                        selected = numbered_choice(argument, codex.models)
+                        if selected is None:
+                            selected = next(
+                                (
+                                    model
+                                    for model in codex.models
+                                    if argument in (model.get("id"), model.get("model"))
+                                ),
+                                None,
+                            )
                         if not selected:
                             await send_message(chat_id, "Unknown model. Send /model to list models.")
                             continue
@@ -951,29 +961,32 @@ async def main():
                         efforts = codex.supported_efforts()
                         if not argument:
                             effort_lines = [
-                                f"{effort}{' ✓' if effort == codex.current_effort else ''}"
-                                for effort in efforts
+                                f"{index}. {effort}{' ✓' if effort == codex.current_effort else ''}"
+                                for index, effort in enumerate(efforts, 1)
                             ]
+                            if efforts:
+                                pending_selection = {"kind": "thinking", "options": efforts}
                             await send_message(
                                 chat_id,
                                 "Supported thinking levels for "
                                 f"{codex.current_model}:\n"
                                 + ("\n".join(effort_lines) or "Default only")
-                                + "\n\nChoose with: /think LEVEL",
+                                + "\n\nReply with the thinking level number to choose.",
                             )
                             continue
 
-                        if argument not in efforts:
+                        selected_effort = numbered_choice(argument, efforts) or argument
+                        if selected_effort not in efforts:
                             await send_message(
                                 chat_id,
                                 "Unsupported thinking level. Send /think to list valid levels.",
                             )
                             continue
 
-                        codex.current_effort = argument
+                        codex.current_effort = selected_effort
                         await send_message(
                             chat_id,
-                            f"Thinking set to {argument}. It applies to the next message.",
+                            f"Thinking set to {selected_effort}. You can send your prompt now.",
                         )
                         continue
 
@@ -1031,7 +1044,8 @@ async def main():
                                 when = format_reset(timestamp) if timestamp else "unknown time"
                                 current = " (current)" if thread.get("id") == codex.thread_id else ""
                                 lines.append(f"{index}. {title} — {when}{current}")
-                            lines.append("\nResume with: /resume NUMBER")
+                            lines.append("\nReply with the conversation number to resume.")
+                            pending_selection = {"kind": "resume", "options": codex.resume_choices}
                             await send_message(chat_id, "\n".join(lines))
                             continue
 
