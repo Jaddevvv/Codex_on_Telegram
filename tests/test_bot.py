@@ -1,72 +1,71 @@
-import json
 import os
-import pathlib
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
-from bot import CodexRunner, Config, extract_session_id, safe_directory, split_message
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
+os.environ.setdefault("ALLOWED_CHAT_ID", "123")
+os.environ.setdefault(
+    "CODEX_EVENT_LOG",
+    os.path.join(tempfile.gettempdir(), "codex-telegram-tests.log"),
+)
 
-
-class SplitMessageTests(unittest.TestCase):
-    def test_short_message_is_unchanged(self):
-        self.assertEqual(split_message("hello", 10), ["hello"])
-
-    def test_long_message_is_split_within_limit(self):
-        chunks = split_message("one two three four", 8)
-        self.assertEqual(" ".join(chunks), "one two three four")
-        self.assertTrue(all(len(chunk) <= 8 for chunk in chunks))
+import bot
 
 
-class SessionParsingTests(unittest.TestCase):
-    def test_extracts_nested_thread_id(self):
-        event = {"type": "thread.started", "data": {"thread_id": "abc-123"}}
-        self.assertEqual(extract_session_id(json.dumps(event)), "abc-123")
+class FormattingTests(unittest.TestCase):
+    def test_normalized_key_ignores_case_and_punctuation(self):
+        self.assertEqual(bot.normalized_key("Context-Window_Tokens"), "contextwindowtokens")
 
-    def test_ignores_non_json_output(self):
-        self.assertIsNone(extract_session_id("not json"))
+    def test_find_value_searches_nested_collections(self):
+        data = {"outer": [{"contextWindowTokens": 200_000}]}
+        self.assertEqual(bot.find_value(data, ["context_window_tokens"]), 200_000)
 
-
-class SafeDirectoryTests(unittest.TestCase):
-    def test_allows_child_directory(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory).resolve()
-            child = root / "project"
-            child.mkdir()
-            self.assertEqual(safe_directory(root, "project"), child)
-
-    def test_rejects_parent_directory(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory).resolve()
-            with self.assertRaisesRegex(ValueError, "inside CODEX_WORKSPACE"):
-                safe_directory(root, "..")
+    def test_format_duration_uses_largest_exact_unit(self):
+        self.assertEqual(bot.format_duration(60), "1h")
+        self.assertEqual(bot.format_duration(1440), "1d")
 
 
-class CodexRunnerTests(unittest.TestCase):
-    def test_runs_prompt_and_captures_answer_and_session(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory).resolve()
-            fake_codex = root / "fake-codex"
-            fake_codex.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json, pathlib, sys\n"
-                "args = sys.argv[1:]\n"
-                "output = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
-                "prompt = sys.stdin.read()\n"
-                "output.write_text('answer: ' + prompt)\n"
-                "print(json.dumps({'type': 'thread.started', 'thread_id': 'thread-1'}))\n"
-            )
-            fake_codex.chmod(0o755)
-            config = Config(
-                token="token",
-                chat_id=1,
-                workspace=root,
-                codex_bin=os.fspath(fake_codex),
-            )
+class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_message_splits_long_text(self):
+        with patch.object(bot, "telegram", new=AsyncMock(side_effect=[{"message_id": 1}, {"message_id": 2}])) as request:
+            sent = await bot.send_message(123, "x" * 4001)
 
-            answer, session_id = CodexRunner(config).run("do the thing", root, None)
+        self.assertEqual([message["message_id"] for message in sent], [1, 2])
+        self.assertEqual(len(request.await_args_list[0].args[1]["text"]), 4000)
+        self.assertEqual(request.await_args_list[1].args[1]["text"], "x")
 
-            self.assertEqual(answer, "answer: do the thing")
-            self.assertEqual(session_id, "thread-1")
+    async def test_edit_message_uses_telegram_edit_endpoint(self):
+        with patch.object(bot, "telegram", new=AsyncMock(return_value={})) as request:
+            await bot.edit_message(123, 456, "progress")
+
+        request.assert_awaited_once_with(
+            "editMessageText",
+            {"chat_id": 123, "message_id": 456, "text": "progress"},
+        )
+
+    async def test_delete_message_uses_telegram_delete_endpoint(self):
+        with patch.object(bot, "telegram", new=AsyncMock(return_value=True)) as request:
+            await bot.delete_message(123, 456)
+
+        request.assert_awaited_once_with(
+            "deleteMessage",
+            {"chat_id": 123, "message_id": 456},
+        )
+
+
+class CodexStatusTests(unittest.TestCase):
+    def test_context_status_reports_used_and_remaining_percent(self):
+        server = bot.CodexAppServer()
+        server.token_usage = {
+            "modelContextWindow": 200_000,
+            "lastTokenUsage": {"totalTokens": 50_000},
+        }
+
+        status = server.context_status()
+
+        self.assertIn("25.0%", status)
+        self.assertIn("75.0%", status)
 
 
 if __name__ == "__main__":

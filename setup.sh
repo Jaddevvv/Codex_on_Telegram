@@ -25,5 +25,5 @@ if [[ ! -f "$project_dir/.env" ]]; then
 fi
 
 echo
-echo "Next: edit .env and set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
+echo "Next: edit .env and set TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID."
 echo "Then start the bot with: ./run.sh"
