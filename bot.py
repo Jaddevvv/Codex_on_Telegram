@@ -25,6 +25,7 @@ EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.
 TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 OPENAI_CITATION_RE = re.compile(r"cite((?:[^]+)+)")
+FAST_SERVICE_TIER = "fast"
 
 PERMISSION_MODES = {
     "ask": {
@@ -320,6 +321,7 @@ class CodexAppServer:
         self.models = []
         self.current_model = None
         self.current_effort = None
+        self.fast_mode = False
         self.permission_mode = normalize_permission_mode(DEFAULT_PERMISSION_MODE) or "approve"
         self.token_usage = None
         self.citation_sources = {}
@@ -684,16 +686,7 @@ class CodexAppServer:
         return thread
 
     async def run(self, prompt):
-        params = {
-            "threadId": self.thread_id,
-            "input": [{"type": "text", "text": prompt}],
-            "cwd": WORKSPACE,
-            "model": self.current_model,
-            "effort": self.current_effort,
-        }
-        params.update(self.turn_permission_params())
-        if self.permission_mode in {"ask", "approve"}:
-            params["sandboxPolicy"]["writableRoots"] = [WORKSPACE]
+        params = self.turn_start_params(prompt)
         result = await self.request("turn/start", params)
 
         turn_id = result["turn"]["id"]
@@ -725,6 +718,20 @@ class CodexAppServer:
         if error:
             raise RuntimeError(error.get("message", str(error)))
         return "Codex completed the turn without a text response."
+
+    def turn_start_params(self, prompt):
+        params = {
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "cwd": WORKSPACE,
+            "model": self.current_model,
+            "effort": self.current_effort,
+            "serviceTier": FAST_SERVICE_TIER if self.fast_mode else None,
+        }
+        params.update(self.turn_permission_params())
+        if self.permission_mode in {"ask", "approve"}:
+            params["sandboxPolicy"]["writableRoots"] = [WORKSPACE]
+        return params
 
     async def interrupt(self):
         if not self.active_turn_id:
@@ -771,6 +778,7 @@ class CodexAppServer:
         lines = [
             f"Model: {self.current_model}",
             f"Thinking: {self.current_effort or 'default'}",
+            f"Fast mode: {'on' if self.fast_mode else 'off'}",
             f"Permissions: {self.permission_summary()}",
             f"Task running: {'yes' if self.active_turn_id else 'no'}",
             f"Last event: {self.last_event} ({event_age})",
@@ -920,6 +928,7 @@ async def main():
                             "/model MODEL_ID — select a model\n"
                             "/think — list thinking levels\n"
                             "/think LEVEL — select a thinking level\n"
+                            "/fast — toggle fast mode for the next turn (off by default)\n"
                             "/permissions — show the three permission choices\n"
                             "/permissions 1|2|3 — choose a permission mode\n"
                             "/compact — compact the current context\n"
@@ -931,6 +940,15 @@ async def main():
                             "/resume — list recent conversations\n"
                             "/resume NUMBER — resume a listed conversation\n"
                             "/new — start a fresh conversation",
+                        )
+                        continue
+
+                    if command == "/fast":
+                        codex.fast_mode = not codex.fast_mode
+                        state = "enabled" if codex.fast_mode else "disabled"
+                        await send_message(
+                            chat_id,
+                            f"Fast mode {state}. Applies to the next turn.",
                         )
                         continue
 

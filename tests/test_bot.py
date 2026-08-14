@@ -68,6 +68,19 @@ class FormattingTests(unittest.TestCase):
     def test_format_goal_handles_empty_goal(self):
         self.assertIn("No goal is set", bot.format_goal(None))
 
+    def test_fast_mode_is_off_by_default_and_sets_service_tier_when_enabled(self):
+        server = bot.CodexAppServer()
+
+        self.assertFalse(server.fast_mode)
+        self.assertIsNone(server.turn_start_params("hello")["serviceTier"])
+
+        server.fast_mode = True
+
+        self.assertEqual(
+            server.turn_start_params("hello")["serviceTier"],
+            "fast",
+        )
+
 
 class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
     def test_split_message_hard_splits_without_separators(self):
