@@ -60,6 +60,7 @@ Start the bridge:
 | `/model MODEL_ID` | Select a model for subsequent turns. |
 | `/think` | List numbered reasoning levels; reply with a number to select one. |
 | `/think LEVEL` | Select a reasoning level for subsequent turns. |
+| `/fast` | Toggle fast mode for the next turn; off by default. |
 | `/permissions` | List the three numbered Codex permission choices; reply with a number to select one. |
 | `/permissions 1` | Ask for approval. |
 | `/permissions 2` | Approve for me (the default). |
