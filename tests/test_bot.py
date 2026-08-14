@@ -25,6 +25,14 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(bot.format_duration(60), "1h")
         self.assertEqual(bot.format_duration(1440), "1d")
 
+    def test_permission_aliases_cover_approval_and_bypass_modes(self):
+        self.assertEqual(bot.normalize_permission_mode("on-request"), "approve")
+        self.assertEqual(bot.normalize_permission_mode("never"), "bypass")
+        self.assertEqual(bot.normalize_permission_mode("danger-full-access"), "full")
+
+    def test_format_goal_handles_empty_goal(self):
+        self.assertIn("No goal is set", bot.format_goal(None))
+
 
 class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
     def test_split_message_hard_splits_without_separators(self):
@@ -78,6 +86,43 @@ class CodexStatusTests(unittest.TestCase):
 
         self.assertIn("25.0%", status)
         self.assertIn("75.0%", status)
+
+
+class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_permission_mode_updates_thread_settings(self):
+        server = bot.CodexAppServer()
+        server.thread_id = "thread-1"
+        server.request = AsyncMock(return_value={})
+
+        await server.set_permission_mode("full")
+
+        server.request.assert_awaited_once_with(
+            "thread/settings/update",
+            {
+                "permissions": None,
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+        )
+        self.assertEqual(server.permission_summary().split(":", 1)[0], "full")
+
+    async def test_compact_and_goal_use_current_thread(self):
+        server = bot.CodexAppServer()
+        server.thread_id = "thread-1"
+        server.request = AsyncMock(
+            side_effect=[{}, {"goal": {"objective": "ship", "status": "active"}}, {"goal": {"objective": "ship"}}, {"cleared": True}]
+        )
+
+        await server.compact_thread()
+        goal = await server.get_goal()
+        await server.set_goal("ship")
+        await server.clear_goal()
+
+        self.assertEqual(goal["objective"], "ship")
+        self.assertEqual(
+            [call.args[0] for call in server.request.await_args_list],
+            ["thread/compact/start", "thread/goal/get", "thread/goal/set", "thread/goal/clear"],
+        )
 
 
 if __name__ == "__main__":
