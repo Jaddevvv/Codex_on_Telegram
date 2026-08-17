@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -126,6 +127,14 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
             "deleteMessage",
             {"chat_id": 123, "message_id": 456},
         )
+
+    async def test_cleanup_progress_message_awaits_cancellation_and_deletes(self):
+        progress_task = asyncio.create_task(asyncio.sleep(60))
+        with patch.object(bot, "delete_message", new=AsyncMock()) as delete:
+            await bot.cleanup_progress_message(progress_task, 123, 456)
+
+        self.assertTrue(progress_task.done())
+        delete.assert_awaited_once_with(123, 456)
 
 
 class CodexStatusTests(unittest.TestCase):
