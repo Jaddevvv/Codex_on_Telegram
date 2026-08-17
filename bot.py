@@ -220,6 +220,26 @@ async def delete_message(chat_id, message_id):
     )
 
 
+async def cleanup_progress_message(progress_task, chat_id, message_id):
+    """Stop progress reporting and remove its message before final delivery."""
+    if progress_task is not None:
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            LOG.warning("Progress reporter stopped with an error: %s", error)
+
+    if message_id is None:
+        return
+
+    try:
+        await delete_message(chat_id, message_id)
+    except Exception as error:
+        LOG.warning("Could not delete progress message: %s", error)
+
+
 async def typing_loop(chat_id):
     try:
         while True:
@@ -1214,59 +1234,80 @@ async def main():
                             codex.progress_updates.get_nowait()
 
                         async def report_progress():
-                            last_update = None
-                            while True:
-                                update = await codex.progress_updates.get()
-                                await asyncio.sleep(0.8)
-                                while not codex.progress_updates.empty():
-                                    update = codex.progress_updates.get_nowait()
-                                if update != last_update:
-                                    text = f"Codex is working…\n\nLatest progress:\n{update}"
-                                    if progress_message["id"] is None:
-                                        sent = await send_message(
-                                            target_chat_id,
-                                            text,
-                                            codex.citation_sources,
-                                        )
-                                        if sent:
-                                            progress_message["id"] = sent[0]["message_id"]
-                                    else:
-                                        try:
-                                            await edit_message(
+                            try:
+                                last_update = None
+                                while True:
+                                    update = await codex.progress_updates.get()
+                                    await asyncio.sleep(0.8)
+                                    while not codex.progress_updates.empty():
+                                        update = codex.progress_updates.get_nowait()
+                                    if update != last_update:
+                                        text = f"Codex is working…\n\nLatest progress:\n{update}"
+                                        if progress_message["id"] is None:
+                                            sent = await send_message(
                                                 target_chat_id,
-                                                progress_message["id"],
                                                 text,
                                                 codex.citation_sources,
                                             )
-                                        except Exception as error:
-                                            if "message is not modified" not in str(error).lower():
-                                                LOG.warning("Could not edit progress message: %s", error)
-                                    last_update = update
+                                            if sent:
+                                                progress_message["id"] = sent[0]["message_id"]
+                                        else:
+                                            try:
+                                                await edit_message(
+                                                    target_chat_id,
+                                                    progress_message["id"],
+                                                    text,
+                                                    codex.citation_sources,
+                                                )
+                                            except Exception as error:
+                                                if "message is not modified" not in str(error).lower():
+                                                    LOG.warning("Could not edit progress message: %s", error)
+                                        last_update = update
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as error:
+                                LOG.warning("Progress reporting stopped: %s", error)
 
                         progress_task = asyncio.create_task(report_progress())
                         try:
-                            response = await codex.run(prompt)
+                            try:
+                                response = await codex.run(prompt)
+                            except Exception as error:
+                                response = f"Codex error: {error}\n\nSend /new and try again."
+                            finally:
+                                # Remove the status message as soon as the app-server
+                                # turn ends, before a potentially long final response
+                                # is sent. This prevents stale "working" messages when
+                                # final delivery stalls or the process restarts.
+                                await cleanup_progress_message(
+                                    progress_task,
+                                    target_chat_id,
+                                    progress_message["id"],
+                                )
+                                progress_task = None
+                                progress_message["id"] = None
+
                             await send_message(
                                 target_chat_id,
                                 response,
                                 codex.citation_sources,
                             )
                         except Exception as error:
-                            await send_message(
-                                target_chat_id,
-                                f"Codex error: {error}\n\nSend /new and try again.",
-                            )
+                            LOG.warning("Could not deliver Codex response: %s", error)
+                            try:
+                                await send_message(
+                                    target_chat_id,
+                                    f"Telegram delivery error: {error}",
+                                )
+                            except Exception as notify_error:
+                                LOG.warning("Could not deliver Telegram error message: %s", notify_error)
                         finally:
                             typing_task.cancel()
-                            progress_task.cancel()
-                            if progress_message["id"] is not None:
-                                try:
-                                    await delete_message(
-                                        target_chat_id,
-                                        progress_message["id"],
-                                    )
-                                except Exception as error:
-                                    LOG.warning("Could not delete progress message: %s", error)
+                            await cleanup_progress_message(
+                                progress_task,
+                                target_chat_id,
+                                progress_message["id"],
+                            )
 
                     running_task = asyncio.create_task(run_prompt(text, chat_id))
 
