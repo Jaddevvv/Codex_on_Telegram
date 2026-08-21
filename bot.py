@@ -24,6 +24,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.log"))
 TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+BACKGROUND_TASK_STOP_TIMEOUT = 5
+TELEGRAM_PROGRESS_TIMEOUT = 15
+TELEGRAM_CLEANUP_TIMEOUT = 5
 OPENAI_CITATION_RE = re.compile(r"cite((?:[^]+)+)")
 FAST_SERVICE_TIER = "fast"
 
@@ -220,24 +223,43 @@ async def delete_message(chat_id, message_id):
     )
 
 
-async def cleanup_progress_message(progress_task, chat_id, message_id):
-    """Stop progress reporting and remove its message before final delivery."""
-    if progress_task is not None:
-        progress_task.cancel()
-        try:
-            await progress_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as error:
-            LOG.warning("Progress reporter stopped with an error: %s", error)
-
-    if message_id is None:
+async def stop_background_task(task, label):
+    """Cancel a UI helper without allowing it to block turn completion."""
+    if task is None:
         return
 
+    task.cancel()
     try:
-        await delete_message(chat_id, message_id)
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=BACKGROUND_TASK_STOP_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        LOG.warning("Timed out stopping %s task", label)
+    except Exception as error:
+        LOG.warning("%s task stopped with an error: %s", label, error)
+
+
+async def cleanup_progress_message(progress_task, chat_id, message_id):
+    """Stop progress reporting and remove its message before final delivery."""
+    await stop_background_task(progress_task, "progress reporter")
+
+    if message_id is None:
+        return True
+
+    try:
+        await asyncio.wait_for(
+            delete_message(chat_id, message_id),
+            timeout=TELEGRAM_CLEANUP_TIMEOUT,
+        )
+        return True
+    except asyncio.TimeoutError:
+        LOG.warning("Timed out deleting progress message %s", message_id)
     except Exception as error:
         LOG.warning("Could not delete progress message: %s", error)
+    return False
 
 
 async def typing_loop(chat_id):
@@ -250,6 +272,112 @@ async def typing_loop(chat_id):
             await asyncio.sleep(4)
     except asyncio.CancelledError:
         pass
+
+
+async def run_prompt_with_progress(codex, prompt, target_chat_id):
+    """Run one turn and make completion independent of Telegram UI cleanup."""
+    typing_task = asyncio.create_task(typing_loop(target_chat_id))
+    progress_message = {"id": None}
+    progress_state = {"active": True}
+    while not codex.progress_updates.empty():
+        codex.progress_updates.get_nowait()
+
+    async def report_progress():
+        try:
+            last_update = None
+            while progress_state["active"]:
+                update = await codex.progress_updates.get()
+                await asyncio.sleep(0.8)
+                if not progress_state["active"]:
+                    return
+                while not codex.progress_updates.empty():
+                    update = codex.progress_updates.get_nowait()
+                if not progress_state["active"] or update == last_update:
+                    continue
+
+                text = f"Codex is working…\n\nLatest progress:\n{update}"
+                try:
+                    if progress_message["id"] is None:
+                        sent = await asyncio.wait_for(
+                            send_message(
+                                target_chat_id,
+                                text,
+                                codex.citation_sources,
+                            ),
+                            timeout=TELEGRAM_PROGRESS_TIMEOUT,
+                        )
+                        if sent:
+                            progress_message["id"] = sent[0]["message_id"]
+                    else:
+                        await asyncio.wait_for(
+                            edit_message(
+                                target_chat_id,
+                                progress_message["id"],
+                                text,
+                                codex.citation_sources,
+                            ),
+                            timeout=TELEGRAM_PROGRESS_TIMEOUT,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning("Timed out sending progress update")
+                except Exception as error:
+                    if "message is not modified" not in str(error).lower():
+                        LOG.warning("Could not send progress update: %s", error)
+                last_update = update
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOG.warning("Progress reporting stopped: %s", error)
+
+    progress_task = asyncio.create_task(report_progress())
+
+    async def finish_progress():
+        nonlocal typing_task, progress_task
+
+        # Mark the reporter inactive before cancellation so a queued update
+        # cannot create or edit a stale message after turn completion.
+        progress_state["active"] = False
+        await stop_background_task(typing_task, "typing indicator")
+        typing_task = None
+
+        deleted = await cleanup_progress_message(
+            progress_task,
+            target_chat_id,
+            progress_message["id"],
+        )
+        progress_task = None
+        if deleted:
+            progress_message["id"] = None
+
+    try:
+        try:
+            response = await codex.run(prompt)
+        except Exception as error:
+            response = f"Codex error: {error}\n\nSend /new and try again."
+        finally:
+            # Stop both UI indicators immediately after the app-server turn
+            # resolves. Final response delivery must not keep them alive.
+            await finish_progress()
+
+        try:
+            await send_message(
+                target_chat_id,
+                response,
+                codex.citation_sources,
+            )
+        except Exception as error:
+            LOG.warning("Could not deliver Codex response: %s", error)
+            try:
+                await send_message(
+                    target_chat_id,
+                    f"Telegram delivery error: {error}",
+                )
+            except Exception as notify_error:
+                LOG.warning("Could not deliver Telegram error message: %s", notify_error)
+    finally:
+        # Retry deletion after response delivery if the bounded first attempt
+        # timed out. This retry cannot delay the response itself.
+        await finish_progress()
 
 
 def normalized_key(value):
@@ -1227,89 +1355,9 @@ async def main():
                         )
                         continue
 
-                    async def run_prompt(prompt, target_chat_id):
-                        typing_task = asyncio.create_task(typing_loop(target_chat_id))
-                        progress_message = {"id": None}
-                        while not codex.progress_updates.empty():
-                            codex.progress_updates.get_nowait()
-
-                        async def report_progress():
-                            try:
-                                last_update = None
-                                while True:
-                                    update = await codex.progress_updates.get()
-                                    await asyncio.sleep(0.8)
-                                    while not codex.progress_updates.empty():
-                                        update = codex.progress_updates.get_nowait()
-                                    if update != last_update:
-                                        text = f"Codex is working…\n\nLatest progress:\n{update}"
-                                        if progress_message["id"] is None:
-                                            sent = await send_message(
-                                                target_chat_id,
-                                                text,
-                                                codex.citation_sources,
-                                            )
-                                            if sent:
-                                                progress_message["id"] = sent[0]["message_id"]
-                                        else:
-                                            try:
-                                                await edit_message(
-                                                    target_chat_id,
-                                                    progress_message["id"],
-                                                    text,
-                                                    codex.citation_sources,
-                                                )
-                                            except Exception as error:
-                                                if "message is not modified" not in str(error).lower():
-                                                    LOG.warning("Could not edit progress message: %s", error)
-                                        last_update = update
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as error:
-                                LOG.warning("Progress reporting stopped: %s", error)
-
-                        progress_task = asyncio.create_task(report_progress())
-                        try:
-                            try:
-                                response = await codex.run(prompt)
-                            except Exception as error:
-                                response = f"Codex error: {error}\n\nSend /new and try again."
-                            finally:
-                                # Remove the status message as soon as the app-server
-                                # turn ends, before a potentially long final response
-                                # is sent. This prevents stale "working" messages when
-                                # final delivery stalls or the process restarts.
-                                await cleanup_progress_message(
-                                    progress_task,
-                                    target_chat_id,
-                                    progress_message["id"],
-                                )
-                                progress_task = None
-                                progress_message["id"] = None
-
-                            await send_message(
-                                target_chat_id,
-                                response,
-                                codex.citation_sources,
-                            )
-                        except Exception as error:
-                            LOG.warning("Could not deliver Codex response: %s", error)
-                            try:
-                                await send_message(
-                                    target_chat_id,
-                                    f"Telegram delivery error: {error}",
-                                )
-                            except Exception as notify_error:
-                                LOG.warning("Could not deliver Telegram error message: %s", notify_error)
-                        finally:
-                            typing_task.cancel()
-                            await cleanup_progress_message(
-                                progress_task,
-                                target_chat_id,
-                                progress_message["id"],
-                            )
-
-                    running_task = asyncio.create_task(run_prompt(text, chat_id))
+                    running_task = asyncio.create_task(
+                        run_prompt_with_progress(codex, text, chat_id)
+                    )
 
             except Exception as error:
                 print(f"Polling error: {error}", flush=True)

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -135,6 +136,85 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(progress_task.done())
         delete.assert_awaited_once_with(123, 456)
+
+    async def test_cleanup_progress_message_is_bounded(self):
+        async def hanging_delete(chat_id, message_id):
+            await asyncio.sleep(60)
+
+        with (
+            patch.object(bot, "delete_message", new=hanging_delete),
+            patch.object(bot, "TELEGRAM_CLEANUP_TIMEOUT", 0.01),
+        ):
+            deleted = await bot.cleanup_progress_message(None, 123, 456)
+
+        self.assertFalse(deleted)
+
+    async def test_completed_turn_stops_typing_before_final_response(self):
+        events = []
+
+        async def fake_typing(chat_id):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                events.append("typing-stopped")
+                raise
+
+        async def fake_run(prompt):
+            await asyncio.sleep(0)
+            return "completed response"
+
+        async def fake_send(chat_id, text, citation_sources=None):
+            events.append(text)
+            return [{"message_id": 1}]
+
+        codex = SimpleNamespace(
+            progress_updates=asyncio.Queue(),
+            citation_sources={},
+            run=fake_run,
+        )
+        with (
+            patch.object(bot, "typing_loop", new=fake_typing),
+            patch.object(bot, "send_message", new=fake_send),
+        ):
+            await bot.run_prompt_with_progress(codex, "finish this", 123)
+
+        self.assertEqual(events, ["typing-stopped", "completed response"])
+
+    async def test_final_response_is_sent_when_progress_cleanup_hangs(self):
+        events = []
+
+        async def fake_typing(chat_id):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise
+
+        async def fake_run(prompt):
+            codex.progress_updates.put_nowait("started work")
+            await asyncio.sleep(0.9)
+            return "completed response"
+
+        async def fake_send(chat_id, text, citation_sources=None):
+            events.append(text)
+            return [{"message_id": 99}]
+
+        async def hanging_delete(chat_id, message_id):
+            await asyncio.sleep(60)
+
+        codex = SimpleNamespace(
+            progress_updates=asyncio.Queue(),
+            citation_sources={},
+            run=fake_run,
+        )
+        with (
+            patch.object(bot, "typing_loop", new=fake_typing),
+            patch.object(bot, "send_message", new=fake_send),
+            patch.object(bot, "delete_message", new=hanging_delete),
+            patch.object(bot, "TELEGRAM_CLEANUP_TIMEOUT", 0.01),
+        ):
+            await bot.run_prompt_with_progress(codex, "finish this", 123)
+
+        self.assertEqual(events[-1], "completed response")
 
 
 class CodexStatusTests(unittest.TestCase):
