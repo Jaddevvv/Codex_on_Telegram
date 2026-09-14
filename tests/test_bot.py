@@ -85,6 +85,141 @@ class FormattingTests(unittest.TestCase):
 
 
 class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
+    def test_changed_attachment_files_returns_only_new_or_modified_files(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            attachment_folder = bot.Path(workspace) / "attachment"
+            attachment_folder.mkdir()
+            existing = attachment_folder / "existing.txt"
+            existing.write_text("before")
+
+            with patch.object(bot, "WORKSPACE", workspace):
+                before = bot.attachment_file_snapshot()
+                existing.write_text("after")
+                new_file = attachment_folder / "new.docx"
+                new_file.write_bytes(b"document")
+                changed = bot.changed_attachment_files(before)
+
+        self.assertEqual(changed, [existing, new_file])
+
+    def test_telegram_upload_document_streams_any_file_as_multipart(self):
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return b'{"ok":true,"result":{"message_id":7}}'
+
+        class FakeConnection:
+            def __init__(self):
+                self.target = None
+                self.headers = {}
+                self.sent = []
+
+            def putrequest(self, method, target):
+                self.target = (method, target)
+
+            def putheader(self, name, value):
+                self.headers[name] = value
+
+            def endheaders(self):
+                pass
+
+            def send(self, data):
+                self.sent.append(data)
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as workspace:
+            path = bot.Path(workspace) / "report.docx"
+            path.write_bytes(b"word document bytes")
+            connection = FakeConnection()
+            with patch.object(bot.http.client, "HTTPSConnection", return_value=connection):
+                result = bot.telegram_upload_document(123, path, "Generated report")
+
+        body = b"".join(connection.sent)
+        self.assertEqual(result["message_id"], 7)
+        self.assertEqual(connection.target[0], "POST")
+        self.assertTrue(connection.target[1].endswith("/sendDocument"))
+        self.assertIn(b'name="document"; filename="report.docx"', body)
+        self.assertIn(b"Generated report", body)
+        self.assertIn(b"word document bytes", body)
+
+    def test_attachment_specs_support_documents_photos_and_media(self):
+        specs = bot.attachment_specs(
+            {
+                "document": {"file_id": "doc-id", "file_name": "report.csv"},
+                "photo": [
+                    {"file_id": "small-photo", "width": 320, "height": 240},
+                    {"file_id": "large-photo", "width": 1280, "height": 960},
+                ],
+                "voice": {"file_id": "voice-id"},
+            }
+        )
+
+        self.assertEqual(
+            specs,
+            [
+                {"file_id": "doc-id", "name": "report.csv", "kind": "document"},
+                {"file_id": "large-photo", "name": "photo.jpg", "kind": "photo"},
+                {"file_id": "voice-id", "name": "voice.ogg", "kind": "voice"},
+            ],
+        )
+
+    def test_prompt_with_attachments_names_fresh_files_and_ignores_older_files(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = bot.Path(workspace)
+            attachment_path = workspace_path / "attachment" / "fresh report.csv"
+
+            with patch.object(bot, "WORKSPACE", workspace):
+                prompt = bot.prompt_with_attachments("Analyze this", [attachment_path])
+
+        self.assertIn("Analyze this", prompt)
+        self.assertIn(
+            "i have sent you attachments in the folder attachment that have been dropped less than a minute ago.",
+            prompt,
+        )
+        self.assertIn("attachment/fresh report.csv", prompt)
+        self.assertIn("ignore older files in that folder", prompt)
+
+    async def test_save_attachments_creates_attachment_folder_and_downloads_files(self):
+        message = {
+            "message_id": 42,
+            "document": {"file_id": "doc-id", "file_name": "../report.csv"},
+        }
+
+        with tempfile.TemporaryDirectory() as workspace:
+            def fake_download(file_path, destination):
+                self.assertEqual(file_path, "documents/report.csv")
+                destination.write_bytes(b"a,b\n1,2\n")
+
+            async def fake_to_thread(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with (
+                patch.object(bot, "WORKSPACE", workspace),
+                patch.object(
+                    bot,
+                    "telegram",
+                    new=AsyncMock(return_value={"file_path": "documents/report.csv"}),
+                ) as telegram_request,
+                patch.object(bot, "telegram_file_download", side_effect=fake_download),
+                patch.object(
+                    bot.asyncio,
+                    "to_thread",
+                    new=fake_to_thread,
+                ),
+            ):
+                saved = await bot.save_attachments(message)
+
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].parent, bot.Path(workspace) / "attachment")
+            self.assertTrue(saved[0].name.endswith("_report.csv"))
+            self.assertEqual(saved[0].read_bytes(), b"a,b\n1,2\n")
+            telegram_request.assert_awaited_once_with("getFile", {"file_id": "doc-id"})
+
     def test_split_message_hard_splits_without_separators(self):
         text = "x" * 10_001
 
@@ -215,6 +350,51 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
             await bot.run_prompt_with_progress(codex, "finish this", 123)
 
         self.assertEqual(events[-1], "completed response")
+
+    async def test_files_created_in_attachment_are_sent_after_final_response(self):
+        events = []
+        documents = []
+
+        async def fake_typing(chat_id):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise
+
+        async def fake_run(prompt):
+            events.append(prompt)
+            output = bot.Path(workspace) / "attachment" / "result.docx"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"generated document")
+            return "created the report"
+
+        async def fake_send_message(chat_id, text, citation_sources=None):
+            events.append(text)
+            return [{"message_id": 1}]
+
+        async def fake_send_document(chat_id, path, caption=None):
+            documents.append((chat_id, path, caption))
+
+        codex = SimpleNamespace(
+            progress_updates=asyncio.Queue(),
+            citation_sources={},
+            run=fake_run,
+        )
+        with tempfile.TemporaryDirectory() as workspace:
+            with (
+                patch.object(bot, "WORKSPACE", workspace),
+                patch.object(bot, "typing_loop", new=fake_typing),
+                patch.object(bot, "send_message", new=fake_send_message),
+                patch.object(bot, "send_document", new=fake_send_document),
+            ):
+                await bot.run_prompt_with_progress(codex, "make a report", 123)
+
+        self.assertIn(bot.OUTBOUND_FILE_PROMPT, events[0])
+        self.assertEqual(events[1], "created the report")
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0][0], 123)
+        self.assertEqual(documents[0][1].name, "result.docx")
+        self.assertEqual(documents[0][2], "Generated file: result.docx")
 
 
 class CodexStatusTests(unittest.TestCase):

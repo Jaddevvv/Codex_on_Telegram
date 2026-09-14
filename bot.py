@@ -2,14 +2,17 @@
 """Private Telegram bridge for the Codex app server."""
 
 import asyncio
+import http.client
 import html
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,9 +24,19 @@ WORKSPACE = os.environ.get("CODEX_WORKSPACE", str(Path.home() / "codex-workspace
 DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "medium")
 DEFAULT_PERMISSION_MODE = os.environ.get("CODEX_PERMISSION_MODE", "approve")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.log"))
 TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+ATTACHMENT_FOLDER_NAME = "attachment"
+ATTACHMENT_PROMPT = (
+    "i have sent you attachments in the folder attachment that have been dropped less than a minute ago."
+)
+OUTBOUND_FILE_PROMPT = (
+    "If you create a file for me to download, save it in the attachment/ folder "
+    "inside the workspace; it will be sent to me as a Telegram document after you finish."
+)
 BACKGROUND_TASK_STOP_TIMEOUT = 5
 TELEGRAM_PROGRESS_TIMEOUT = 15
 TELEGRAM_CLEANUP_TIMEOUT = 5
@@ -99,6 +112,241 @@ async def telegram(method, values=None, timeout=70):
         values,
         timeout,
     )
+
+
+def telegram_file_download(file_path, destination):
+    """Stream one Telegram file to disk without keeping it in memory."""
+    encoded_path = urllib.parse.quote(str(file_path), safe="/")
+    request = urllib.request.Request(
+        f"{TELEGRAM_FILE_API}/{encoded_path}",
+        method="GET",
+    )
+
+    with urllib.request.urlopen(request, timeout=70) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"Telegram attachment is larger than the {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit"
+            )
+
+        bytes_written = 0
+        with destination.open("wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > MAX_ATTACHMENT_BYTES:
+                    raise ValueError(
+                        f"Telegram attachment is larger than the {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit"
+                    )
+                output.write(chunk)
+
+    return bytes_written
+
+
+def telegram_upload_document(chat_id, path, caption=None):
+    """Stream one workspace file to Telegram as a document attachment."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"Generated file does not exist: {path}")
+
+    file_size = path.stat().st_size
+    if file_size > MAX_ATTACHMENT_BYTES:
+        raise ValueError(
+            f"Generated file is larger than the {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit"
+        )
+
+    parsed_api = urllib.parse.urlsplit(TELEGRAM_API)
+    boundary = f"----CodexTelegram{uuid.uuid4().hex}"
+    filename = safe_attachment_name(path.name, "attachment")
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    fields = [
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+            f"{chat_id}\r\n"
+        ).encode(),
+    ]
+    if caption:
+        fields.append(
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="caption"\r\n\r\n'
+                f"{str(caption)[:1024]}\r\n"
+            ).encode()
+        )
+    file_header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode()
+    closing = f"\r\n--{boundary}--\r\n".encode()
+    content_length = sum(len(field) for field in fields) + len(file_header) + file_size + len(closing)
+
+    connection = http.client.HTTPSConnection(parsed_api.netloc, timeout=70)
+    try:
+        connection.putrequest("POST", f"{parsed_api.path.rstrip('/')}/sendDocument")
+        connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        connection.putheader("Content-Length", str(content_length))
+        connection.endheaders()
+
+        for field in fields:
+            connection.send(field)
+        connection.send(file_header)
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                connection.send(chunk)
+        connection.send(closing)
+
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode())
+    finally:
+        connection.close()
+
+    if response.status >= 400 or not payload.get("ok"):
+        raise RuntimeError(f"Telegram error sending {filename}: {payload}")
+    return payload["result"]
+
+
+async def send_document(chat_id, path, caption=None):
+    return await asyncio.to_thread(telegram_upload_document, chat_id, path, caption)
+
+
+def attachment_file_snapshot():
+    """Snapshot regular files in the exchange folder before a Codex turn."""
+    folder = Path(WORKSPACE) / ATTACHMENT_FOLDER_NAME
+    if not folder.is_dir():
+        return {}
+
+    snapshot = {}
+    for path in folder.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+    return snapshot
+
+
+def changed_attachment_files(before):
+    """Return files created or changed in attachment/ during the turn."""
+    after = attachment_file_snapshot()
+    changed = [path for path, state in after.items() if before.get(path) != state]
+    return sorted(changed, key=lambda path: str(path))
+
+
+def safe_attachment_name(name, fallback):
+    """Keep Telegram-provided names inside the attachment folder."""
+    value = Path(str(name or "")).name
+    value = re.sub(r"[\x00-\x1f\x7f]+", "_", value)
+    value = re.sub(r"[^A-Za-z0-9._() -]", "_", value).strip(" .")
+    return (value[:120] or fallback)
+
+
+def attachment_specs(message):
+    """Extract downloadable files from the media fields of a Telegram message."""
+    specs = []
+
+    def add_media(media, default_name, kind):
+        if not isinstance(media, dict) or not media.get("file_id"):
+            return
+        specs.append(
+            {
+                "file_id": media["file_id"],
+                "name": media.get("file_name") or default_name,
+                "kind": kind,
+            }
+        )
+
+    add_media(message.get("document"), "document", "document")
+
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        photo = max(
+            (item for item in photos if isinstance(item, dict)),
+            key=lambda item: (
+                item.get("file_size", 0),
+                item.get("width", 0) * item.get("height", 0),
+            ),
+            default=None,
+        )
+        add_media(photo, "photo.jpg", "photo")
+
+    add_media(message.get("audio"), "audio", "audio")
+    add_media(message.get("video"), "video.mp4", "video")
+    add_media(message.get("animation"), "animation.mp4", "animation")
+    add_media(message.get("voice"), "voice.ogg", "voice")
+    add_media(message.get("video_note"), "video_note.mp4", "video_note")
+    add_media(message.get("sticker"), "sticker.webp", "sticker")
+    return specs
+
+
+async def save_attachments(message):
+    """Download all files from one Telegram message into workspace/attachment."""
+    specs = attachment_specs(message)
+    if not specs:
+        return []
+
+    attachment_folder = Path(WORKSPACE) / ATTACHMENT_FOLDER_NAME
+    attachment_folder.mkdir(parents=True, exist_ok=True)
+    message_id = str(message.get("message_id", "unknown"))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    saved_paths = []
+
+    try:
+        for index, spec in enumerate(specs, 1):
+            filename = safe_attachment_name(
+                spec["name"],
+                f"{spec['kind']}_{index}",
+            )
+            destination = attachment_folder / f"{timestamp}_{message_id}_{index}_{filename}"
+            file_info = await telegram("getFile", {"file_id": spec["file_id"]})
+            file_path = file_info.get("file_path") if isinstance(file_info, dict) else None
+            if not file_path:
+                raise RuntimeError(f"Telegram did not return a file path for {filename}")
+            try:
+                await asyncio.to_thread(telegram_file_download, file_path, destination)
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+            saved_paths.append(destination)
+    except Exception:
+        for path in saved_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+    return saved_paths
+
+
+def prompt_with_attachments(text, paths):
+    """Tell Codex exactly where this message's fresh attachments were placed."""
+    relative_paths = []
+    workspace = Path(WORKSPACE)
+    for path in paths:
+        try:
+            relative_paths.append(str(path.relative_to(workspace)))
+        except ValueError:
+            relative_paths.append(str(path))
+
+    files = "\n".join(f"- {path}" for path in relative_paths)
+    attachment_context = (
+        f"{ATTACHMENT_PROMPT}\n"
+        "Only inspect files from this message that were modified less than one minute ago; "
+        "ignore older files in that folder.\n"
+        f"Files from this message:\n{files}"
+    )
+    text = (text or "").strip()
+    return f"{text}\n\n{attachment_context}".strip()
 
 
 def clean_telegram_text(text, citation_sources=None):
@@ -276,6 +524,8 @@ async def typing_loop(chat_id):
 
 async def run_prompt_with_progress(codex, prompt, target_chat_id):
     """Run one turn and make completion independent of Telegram UI cleanup."""
+    files_before_turn = attachment_file_snapshot()
+    codex_prompt = f"{prompt.rstrip()}\n\n{OUTBOUND_FILE_PROMPT}".strip()
     typing_task = asyncio.create_task(typing_loop(target_chat_id))
     progress_message = {"id": None}
     progress_state = {"active": True}
@@ -350,8 +600,10 @@ async def run_prompt_with_progress(codex, prompt, target_chat_id):
             progress_message["id"] = None
 
     try:
+        turn_succeeded = False
         try:
-            response = await codex.run(prompt)
+            response = await codex.run(codex_prompt)
+            turn_succeeded = True
         except Exception as error:
             response = f"Codex error: {error}\n\nSend /new and try again."
         finally:
@@ -374,6 +626,25 @@ async def run_prompt_with_progress(codex, prompt, target_chat_id):
                 )
             except Exception as notify_error:
                 LOG.warning("Could not deliver Telegram error message: %s", notify_error)
+
+        if turn_succeeded:
+            outbound_files = changed_attachment_files(files_before_turn)
+            for path in outbound_files:
+                try:
+                    await send_document(
+                        target_chat_id,
+                        path,
+                        caption=f"Generated file: {path.name}",
+                    )
+                except Exception as error:
+                    LOG.warning("Could not deliver generated file %s: %s", path, error)
+                    try:
+                        await send_message(
+                            target_chat_id,
+                            f"Could not send generated file {path.name}: {error}",
+                        )
+                    except Exception as notify_error:
+                        LOG.warning("Could not deliver generated-file error message: %s", notify_error)
     finally:
         # Retry deletion after response delivery if the bounded first attempt
         # timed out. This retry cannot delay the response itself.
@@ -992,8 +1263,9 @@ async def main():
                     if chat_id != ALLOWED_CHAT_ID:
                         continue
 
-                    text = message.get("text")
-                    if not text:
+                    attachment_messages = attachment_specs(message)
+                    text = message.get("text") or message.get("caption")
+                    if not text and not attachment_messages:
                         await send_message(chat_id, "For now, send me a text message.")
                         continue
 
@@ -1354,6 +1626,18 @@ async def main():
                             "Codex is already working. Use /status or /stop.",
                         )
                         continue
+
+                    if attachment_messages:
+                        try:
+                            saved_attachments = await save_attachments(message)
+                        except Exception as error:
+                            LOG.warning("Could not save Telegram attachments: %s", error)
+                            await send_message(
+                                chat_id,
+                                f"Could not save the Telegram attachment(s): {error}",
+                            )
+                            continue
+                        text = prompt_with_attachments(text, saved_attachments)
 
                     running_task = asyncio.create_task(
                         run_prompt_with_progress(codex, text, chat_id)

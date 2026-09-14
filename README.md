@@ -7,6 +7,8 @@ The project uses Telegram long polling, Python's standard library, and your exis
 ## Features
 
 - Send coding tasks to Codex from Telegram.
+- Receive Telegram documents, images, and common media in the workspace `attachment/` folder.
+- Send generated files back as Telegram document attachments, including CSV, Word, PDF, image, and ZIP files.
 - See live progress in one message that is edited as work advances.
 - Automatically delete the progress message after the final answer or error.
 - Select a Codex model with `/model`.
@@ -77,6 +79,10 @@ Start the bridge:
 | `/resume NUMBER` | Resume a listed conversation. |
 
 If a numbered menu is active, the next message is used as that selection. Otherwise, any other text starts a Codex turn. Only one turn runs at a time.
+
+When a message includes an attachment, the bridge downloads it to `attachment/` inside `CODEX_WORKSPACE` and adds the file path to the Codex prompt. The prompt also identifies files dropped less than one minute ago, so older files in that folder are ignored.
+
+Files created or modified in `attachment/` during a successful Codex turn are sent back after the text response as Telegram document attachments. This supports arbitrary file types accepted by Telegram and uses a 50 MB per-file guard.
 
 ## Configuration
 
