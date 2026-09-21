@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex on Telegram cgroup OOM watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/YOUR_USER/Codex_on_Telegram
+EnvironmentFile=/home/YOUR_USER/Codex_on_Telegram/.env
+Environment=CODEX_SERVICE_CGROUP=/user.slice/user-%U.slice/user@%U.service/app.slice/codex-telegram.service
+Environment=CODEX_ENV_FILE=/home/YOUR_USER/Codex_on_Telegram/.env
+ExecStart=/usr/bin/python3 /home/YOUR_USER/Codex_on_Telegram/oom_watch.py
+MemoryMax=128M
+MemorySwapMax=0
+OOMPolicy=continue
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
