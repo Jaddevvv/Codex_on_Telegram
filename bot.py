@@ -21,8 +21,9 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 CODEX_BIN = os.environ.get("CODEX_BIN", "/root/.local/bin/codex")
 WORKSPACE = os.environ.get("CODEX_WORKSPACE", str(Path.home() / "codex-workspace"))
-DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "medium")
-DEFAULT_PERMISSION_MODE = os.environ.get("CODEX_PERMISSION_MODE", "approve")
+DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-luna")
+DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "xhigh")
+DEFAULT_PERMISSION_MODE = os.environ.get("CODEX_PERMISSION_MODE", "full")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.log"))
@@ -44,6 +45,7 @@ TELEGRAM_PROGRESS_TIMEOUT = 15
 TELEGRAM_CLEANUP_TIMEOUT = 5
 OPENAI_CITATION_RE = re.compile(r"cite((?:[^]+)+)")
 FAST_SERVICE_TIER = "fast"
+STATUS_COMMANDS = {"/status", "/debug", "/usage"}
 
 PERMISSION_MODES = {
     "ask": {
@@ -1071,9 +1073,13 @@ class CodexAppServer:
 
         if not self.current_model:
             selected = next(
-                (model for model in self.models if model.get("isDefault")),
-                self.models[0] if self.models else None,
-            )
+                (
+                    model
+                    for model in self.models
+                    if DEFAULT_MODEL in (model.get("id"), model.get("model"))
+                ),
+                next((model for model in self.models if model.get("isDefault")), None),
+            ) or (self.models[0] if self.models else None)
             if selected:
                 self.current_model = selected.get("model") or selected.get("id")
                 supported = {
@@ -1467,7 +1473,7 @@ async def main():
                             "/goal — show the current goal\n"
                             "/goal OBJECTIVE — set a durable goal\n"
                             "/goal clear — remove the current goal\n"
-                            "/status or /debug — live task and last event\n"
+                            "/status, /usage, or /debug — live task and last event\n"
                             "/stop — stop the current task\n"
                             "/resume — list recent conversations\n"
                             "/resume NUMBER — resume a listed conversation\n"
@@ -1647,7 +1653,7 @@ async def main():
                         )
                         continue
 
-                    if command in {"/status", "/debug"}:
+                    if command in STATUS_COMMANDS:
                         try:
                             await send_message(chat_id, await codex.status_text())
                         except Exception as error:

@@ -398,6 +398,8 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodexStatusTests(unittest.TestCase):
+    def test_usage_is_a_status_alias(self):
+        self.assertEqual(bot.STATUS_COMMANDS, {"/status", "/debug", "/usage"})
     def test_memory_snapshot_reads_cgroup_limits_and_events(self):
         with tempfile.TemporaryDirectory() as directory:
             cgroup = bot.Path(directory)
@@ -429,6 +431,30 @@ class CodexStatusTests(unittest.TestCase):
 
 
 class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_model_effort_and_permissions_are_selected(self):
+        server = bot.CodexAppServer()
+        server.request = AsyncMock(
+            return_value={
+                "data": [
+                    {
+                        "model": "gpt-5.6-luna",
+                        "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+                    },
+                    {"model": "other-model", "isDefault": True},
+                ]
+            }
+        )
+
+        await server.refresh_models()
+
+        self.assertEqual(server.current_model, "gpt-5.6-luna")
+        self.assertEqual(server.current_effort, "xhigh")
+        self.assertEqual(server.permission_mode, "full")
+        self.assertEqual(
+            server.thread_permission_params(),
+            {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+        )
+
     async def test_full_permission_mode_updates_thread_settings(self):
         server = bot.CodexAppServer()
         server.thread_id = "thread-1"

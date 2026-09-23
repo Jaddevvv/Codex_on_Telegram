@@ -11,12 +11,13 @@ The project uses Telegram long polling, Python's standard library, and your exis
 - Send generated files back as Telegram document attachments, including CSV, Word, PDF, image, and ZIP files.
 - See live progress in one message that is edited as work advances.
 - Automatically delete the progress message after the final answer or error.
+- Start new conversations with GPT-5.6-Luna at extra-high reasoning and Full Access permissions.
 - Select a Codex model with `/model`.
 - Select supported reasoning effort with `/think`.
 - Choose approval and sandbox behavior with `/permissions`.
 - Compact the active context with `/compact`.
 - Set, inspect, pause, complete, or clear a durable thread goal with `/goal`.
-- Inspect task, context, and subscription-limit status with `/status`.
+- Inspect task, context, and subscription-limit status with `/status` or `/usage`.
 - Stop an active turn, start a new conversation, or resume a recent conversation.
 - Restrict access to one Telegram chat ID.
 - Split long responses into Telegram-safe chunks.
@@ -42,7 +43,9 @@ Edit `.env`:
 TELEGRAM_BOT_TOKEN=123456789:your_real_bot_token
 ALLOWED_CHAT_ID=123456789
 CODEX_WORKSPACE=/home/me/code
-CODEX_DEFAULT_EFFORT=medium
+CODEX_DEFAULT_MODEL=gpt-5.6-luna
+CODEX_DEFAULT_EFFORT=xhigh
+CODEX_PERMISSION_MODE=full
 ```
 
 Find your private chat ID by messaging the bot and opening `https://api.telegram.org/bot<TOKEN>/getUpdates`. Use the numeric `message.chat.id` value.
@@ -72,7 +75,7 @@ Start the bridge:
 | `/goal OBJECTIVE` | Set or replace the current durable goal. |
 | `/goal paused`, `/goal complete` | Change the current goal status. |
 | `/goal clear` | Remove the current durable goal. |
-| `/status`, `/debug` | Show the model, reasoning level, active task, context use, and rate limits. |
+| `/status`, `/usage`, `/debug` | Show the model, reasoning level, active task, context use, and rate limits. |
 | `/stop` | Interrupt the active turn. |
 | `/new` | Start a fresh Codex conversation. |
 | `/resume` | List recent conversations. |
@@ -92,8 +95,9 @@ Files created or modified in `attachment/` during a successful Codex turn are se
 | `ALLOWED_CHAT_ID` | Yes | — | The only Telegram chat allowed to control Codex. |
 | `CODEX_BIN` | No | `/root/.local/bin/codex` | Path to the Codex executable. |
 | `CODEX_WORKSPACE` | No | `~/codex-workspace` | Working directory and writable root provided to Codex. |
-| `CODEX_DEFAULT_EFFORT` | No | `medium` | Preferred reasoning effort when supported by the model. |
-| `CODEX_PERMISSION_MODE` | No | `approve` | Initial mode: `1` (ask), `2` (approve for me), or `3` (full access). |
+| `CODEX_DEFAULT_MODEL` | No | `gpt-5.6-luna` | Model selected for new conversations when available. |
+| `CODEX_DEFAULT_EFFORT` | No | `xhigh` | Preferred reasoning effort when supported by the model. |
+| `CODEX_PERMISSION_MODE` | No | `full` | Initial mode: `1` (ask), `2` (approve for me), or `3` (full access). |
 | `CODEX_EVENT_LOG` | No | `/root/codex-telegram/events.log` | Private app-server event log path. |
 
 The live service applies a memory guard: research children are throttled above
