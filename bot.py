@@ -31,6 +31,8 @@ TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 ATTACHMENT_FOLDER_NAME = "attachment"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+MEMORY_GUARD_INTERVAL = 2
 ATTACHMENT_PROMPT = (
     "i have sent you attachments in the folder attachment that have been dropped less than a minute ago."
 )
@@ -88,6 +90,113 @@ logging.basicConfig(
 )
 os.chmod(EVENT_LOG, 0o600)
 LOG = logging.getLogger("codex-telegram")
+
+
+def cgroup_memory_directory():
+    """Return this service's cgroup v2 directory, when available."""
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0":
+            directory = CGROUP_ROOT / fields[2].lstrip("/")
+            return directory if directory.is_dir() else None
+    return None
+
+
+def _memory_value(value):
+    value = value.strip()
+    if value in {"max", "infinity"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def read_memory_snapshot(directory=None):
+    directory = directory or cgroup_memory_directory()
+    if directory is None:
+        return None
+
+    snapshot = {}
+    for name in ("memory.current", "memory.high", "memory.max", "memory.swap.max"):
+        try:
+            snapshot[name] = _memory_value((directory / name).read_text())
+        except OSError:
+            snapshot[name] = None
+
+    try:
+        events = (directory / "memory.events").read_text().splitlines()
+    except OSError:
+        events = []
+    snapshot["events"] = {}
+    for line in events:
+        key, separator, value = line.partition(" ")
+        if separator:
+            try:
+                snapshot["events"][key] = int(value)
+            except ValueError:
+                continue
+    return snapshot
+
+
+def format_bytes(value):
+    if value is None:
+        return "unlimited"
+    value = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024 or unit == "GiB":
+            return f"{value:.0f} {unit}"
+        value /= 1024
+
+
+def memory_guard_status():
+    snapshot = read_memory_snapshot()
+    if snapshot is None:
+        return "Memory guard: cgroup v2 unavailable"
+    events = snapshot["events"]
+    return (
+        f"Memory: {format_bytes(snapshot['memory.current'])} used; "
+        f"high {format_bytes(snapshot['memory.high'])}; "
+        f"max {format_bytes(snapshot['memory.max'])}; "
+        f"OOM kills {events.get('oom_kill', 0)}"
+    )
+
+
+async def monitor_cgroup_oom(codex):
+    """Interrupt a turn if a capped child is killed by the cgroup OOM guard."""
+    previous = read_memory_snapshot()
+    if previous is None:
+        LOG.warning("Memory cgroup guard is unavailable")
+
+    while True:
+        await asyncio.sleep(MEMORY_GUARD_INTERVAL)
+        current = read_memory_snapshot()
+        if current is None:
+            continue
+
+        previous_events = previous["events"] if previous else {}
+        current_events = current["events"]
+        previous_kills = previous_events.get("oom_kill", 0) + previous_events.get("oom_group_kill", 0)
+        current_kills = current_events.get("oom_kill", 0) + current_events.get("oom_group_kill", 0)
+        if current_kills > previous_kills:
+            LOG.error(
+                "Memory guard killed a child process: oom_kill=%s oom_group_kill=%s current=%s max=%s",
+                current_events.get("oom_kill", 0),
+                current_events.get("oom_group_kill", 0),
+                format_bytes(current["memory.current"]),
+                format_bytes(current["memory.max"]),
+            )
+            if codex.active_turn_id:
+                try:
+                    await asyncio.wait_for(codex.interrupt(), timeout=5)
+                except Exception as error:
+                    LOG.warning("Could not interrupt the turn after a memory guard event: %s", error)
+        previous = current
 
 
 def telegram_request(method, values=None, timeout=70):
@@ -1208,6 +1317,7 @@ class CodexAppServer:
             f"Task running: {'yes' if self.active_turn_id else 'no'}",
             f"Last event: {self.last_event} ({event_age})",
             self.context_status(),
+            memory_guard_status(),
             "",
             "Subscription limits:",
         ]
@@ -1245,8 +1355,10 @@ async def main():
     codex = CodexAppServer()
     running_task = None
     pending_selection = None
+    memory_guard_task = None
     await telegram("deleteWebhook", {"drop_pending_updates": "false"})
     await codex.start()
+    memory_guard_task = asyncio.create_task(monitor_cgroup_oom(codex))
 
     try:
         while True:
@@ -1653,6 +1765,12 @@ async def main():
                 print(f"Polling error: {error}", flush=True)
                 await asyncio.sleep(5)
     finally:
+        if memory_guard_task:
+            memory_guard_task.cancel()
+            try:
+                await memory_guard_task
+            except asyncio.CancelledError:
+                pass
         await codex.close()
 
 

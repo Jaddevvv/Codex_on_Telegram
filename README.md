@@ -100,6 +100,12 @@ Files created or modified in `attachment/` during a successful Codex turn are se
 | `CODEX_PERMISSION_MODE` | No | `full` | Initial mode: `1` (ask), `2` (approve for me), or `3` (full access). |
 | `CODEX_EVENT_LOG` | No | `/root/codex-telegram/events.log` | Private app-server event log path. |
 
+The live service applies a memory guard: research children are throttled above
+1 GiB and hard-capped at 1.5 GiB, with numeric worker threads limited to one.
+An independent `codex-telegram-oom-watch.service` watches the service cgroup
+and sends an alert to the allowed Telegram chat if the hard cap ever kills a
+worker. The watcher also keeps a local `oom_watch.log` for diagnosis.
+
 Restart the bridge after changing `.env`.
 
 ## Continuous operation with systemd

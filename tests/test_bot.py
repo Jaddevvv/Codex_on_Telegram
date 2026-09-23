@@ -400,6 +400,22 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
 class CodexStatusTests(unittest.TestCase):
     def test_usage_is_a_status_alias(self):
         self.assertEqual(bot.STATUS_COMMANDS, {"/status", "/debug", "/usage"})
+    def test_memory_snapshot_reads_cgroup_limits_and_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cgroup = bot.Path(directory)
+            (cgroup / "memory.current").write_text("123456789\n")
+            (cgroup / "memory.high").write_text("1073741824\n")
+            (cgroup / "memory.max").write_text("1610612736\n")
+            (cgroup / "memory.swap.max").write_text("0\n")
+            (cgroup / "memory.events").write_text("high 4\nmax 2\noom 1\noom_kill 1\n")
+
+            snapshot = bot.read_memory_snapshot(cgroup)
+
+        self.assertEqual(snapshot["memory.current"], 123456789)
+        self.assertEqual(snapshot["memory.max"], 1610612736)
+        self.assertEqual(snapshot["memory.swap.max"], 0)
+        self.assertEqual(snapshot["events"]["oom_kill"], 1)
+        self.assertIn("118 MiB", bot.format_bytes(snapshot["memory.current"]))
 
     def test_context_status_reports_used_and_remaining_percent(self):
         server = bot.CodexAppServer()
