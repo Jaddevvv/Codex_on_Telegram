@@ -167,7 +167,7 @@ def memory_guard_status():
     )
 
 
-async def monitor_cgroup_oom(codex):
+async def monitor_cgroup_oom(sessions):
     """Interrupt a turn if a capped child is killed by the cgroup OOM guard."""
     previous = read_memory_snapshot()
     if previous is None:
@@ -191,11 +191,17 @@ async def monitor_cgroup_oom(codex):
                 format_bytes(current["memory.current"]),
                 format_bytes(current["memory.max"]),
             )
-            if codex.active_turn_id:
+            for session in list(sessions.values()):
+                codex = session["codex"]
+                if not codex.active_turn_id:
+                    continue
                 try:
                     await asyncio.wait_for(codex.interrupt(), timeout=5)
                 except Exception as error:
-                    LOG.warning("Could not interrupt the turn after a memory guard event: %s", error)
+                    LOG.warning(
+                        "Could not interrupt a turn after a memory guard event: %s",
+                        error,
+                    )
         previous = current
 
 
@@ -256,7 +262,7 @@ def telegram_file_download(file_path, destination):
     return bytes_written
 
 
-def telegram_upload_document(chat_id, path, caption=None):
+def telegram_upload_document(chat_id, path, caption=None, message_thread_id=None):
     """Stream one workspace file to Telegram as a document attachment."""
     path = Path(path)
     if path.is_symlink() or not path.is_file():
@@ -280,6 +286,14 @@ def telegram_upload_document(chat_id, path, caption=None):
             f"{chat_id}\r\n"
         ).encode(),
     ]
+    if message_thread_id is not None:
+        fields.append(
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="message_thread_id"\r\n\r\n'
+                f"{message_thread_id}\r\n"
+            ).encode()
+        )
     if caption:
         fields.append(
             (
@@ -324,13 +338,26 @@ def telegram_upload_document(chat_id, path, caption=None):
     return payload["result"]
 
 
-async def send_document(chat_id, path, caption=None):
-    return await asyncio.to_thread(telegram_upload_document, chat_id, path, caption)
+async def send_document(chat_id, path, caption=None, message_thread_id=None):
+    return await asyncio.to_thread(
+        telegram_upload_document,
+        chat_id,
+        path,
+        caption,
+        message_thread_id,
+    )
 
 
-def attachment_file_snapshot():
-    """Snapshot regular files in the exchange folder before a Codex turn."""
+def attachment_folder_for_thread(session_thread_id=None):
     folder = Path(WORKSPACE) / ATTACHMENT_FOLDER_NAME
+    if session_thread_id is not None:
+        folder = folder / "telegram_topics" / str(session_thread_id)
+    return folder
+
+
+def attachment_file_snapshot(folder=None):
+    """Snapshot regular files in the exchange folder before a Codex turn."""
+    folder = Path(folder) if folder is not None else attachment_folder_for_thread()
     if not folder.is_dir():
         return {}
 
@@ -346,9 +373,9 @@ def attachment_file_snapshot():
     return snapshot
 
 
-def changed_attachment_files(before):
+def changed_attachment_files(before, folder=None):
     """Return files created or changed in attachment/ during the turn."""
-    after = attachment_file_snapshot()
+    after = attachment_file_snapshot(folder)
     changed = [path for path, state in after.items() if before.get(path) != state]
     return sorted(changed, key=lambda path: str(path))
 
@@ -399,13 +426,13 @@ def attachment_specs(message):
     return specs
 
 
-async def save_attachments(message):
+async def save_attachments(message, folder=None):
     """Download all files from one Telegram message into workspace/attachment."""
     specs = attachment_specs(message)
     if not specs:
         return []
 
-    attachment_folder = Path(WORKSPACE) / ATTACHMENT_FOLDER_NAME
+    attachment_folder = Path(folder) if folder is not None else attachment_folder_for_thread()
     attachment_folder.mkdir(parents=True, exist_ok=True)
     message_id = str(message.get("message_id", "unknown"))
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -545,18 +572,18 @@ def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
     return [text[start:start + limit] for start in range(0, len(text), limit)]
 
 
-async def send_message(chat_id, text, citation_sources=None):
+async def send_message(chat_id, text, citation_sources=None, message_thread_id=None):
     sent = []
 
     for chunk in split_message(clean_telegram_text(text, citation_sources)):
-        sent.append(await telegram(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": telegram_html(chunk, citation_sources),
-                "parse_mode": "HTML",
-            },
-        ))
+        values = {
+            "chat_id": chat_id,
+            "text": telegram_html(chunk, citation_sources),
+            "parse_mode": "HTML",
+        }
+        if message_thread_id is not None:
+            values["message_thread_id"] = message_thread_id
+        sent.append(await telegram("sendMessage", values))
     return sent
 
 
@@ -621,23 +648,58 @@ async def cleanup_progress_message(progress_task, chat_id, message_id):
     return False
 
 
-async def typing_loop(chat_id):
+async def typing_loop(chat_id, message_thread_id=None):
     try:
         while True:
+            values = {"chat_id": chat_id, "action": "typing"}
+            if message_thread_id is not None:
+                values["message_thread_id"] = message_thread_id
             await telegram(
                 "sendChatAction",
-                {"chat_id": chat_id, "action": "typing"},
+                values,
             )
             await asyncio.sleep(4)
     except asyncio.CancelledError:
         pass
 
 
-async def run_prompt_with_progress(codex, prompt, target_chat_id):
+async def run_prompt_with_progress(
+    codex,
+    prompt,
+    target_chat_id,
+    message_thread_id=None,
+    session_thread_id=None,
+):
     """Run one turn and make completion independent of Telegram UI cleanup."""
-    files_before_turn = attachment_file_snapshot()
+    output_folder = attachment_folder_for_thread(session_thread_id)
+    if session_thread_id is not None:
+        output_folder.mkdir(parents=True, exist_ok=True)
+    files_before_turn = attachment_file_snapshot(output_folder)
     codex_prompt = f"{prompt.rstrip()}\n\n{OUTBOUND_FILE_PROMPT}".strip()
-    typing_task = asyncio.create_task(typing_loop(target_chat_id))
+    if session_thread_id is not None:
+        relative_output_folder = output_folder.relative_to(Path(WORKSPACE))
+        codex_prompt += (
+            f"\n\nFor this Telegram topic, save downloadable files in "
+            f"`{relative_output_folder}/`; files in that folder are sent back "
+            "to this topic."
+        )
+    if message_thread_id is None:
+        typing_task = asyncio.create_task(typing_loop(target_chat_id))
+    else:
+        typing_task = asyncio.create_task(
+            typing_loop(target_chat_id, message_thread_id)
+        )
+
+    async def send_thread_message(text, citation_sources=None):
+        if message_thread_id is None:
+            return await send_message(target_chat_id, text, citation_sources)
+        return await send_message(
+            target_chat_id,
+            text,
+            citation_sources,
+            message_thread_id=message_thread_id,
+        )
+
     progress_message = {"id": None}
     progress_state = {"active": True}
     while not codex.progress_updates.empty():
@@ -660,11 +722,7 @@ async def run_prompt_with_progress(codex, prompt, target_chat_id):
                 try:
                     if progress_message["id"] is None:
                         sent = await asyncio.wait_for(
-                            send_message(
-                                target_chat_id,
-                                text,
-                                codex.citation_sources,
-                            ),
+                            send_thread_message(text, codex.citation_sources),
                             timeout=TELEGRAM_PROGRESS_TIMEOUT,
                         )
                         if sent:
@@ -723,36 +781,36 @@ async def run_prompt_with_progress(codex, prompt, target_chat_id):
             await finish_progress()
 
         try:
-            await send_message(
-                target_chat_id,
-                response,
-                codex.citation_sources,
-            )
+            await send_thread_message(response, codex.citation_sources)
         except Exception as error:
             LOG.warning("Could not deliver Codex response: %s", error)
             try:
-                await send_message(
-                    target_chat_id,
-                    f"Telegram delivery error: {error}",
-                )
+                await send_thread_message(f"Telegram delivery error: {error}")
             except Exception as notify_error:
                 LOG.warning("Could not deliver Telegram error message: %s", notify_error)
 
         if turn_succeeded:
-            outbound_files = changed_attachment_files(files_before_turn)
+            outbound_files = changed_attachment_files(files_before_turn, output_folder)
             for path in outbound_files:
                 try:
-                    await send_document(
-                        target_chat_id,
-                        path,
-                        caption=f"Generated file: {path.name}",
-                    )
+                    if message_thread_id is None:
+                        await send_document(
+                            target_chat_id,
+                            path,
+                            caption=f"Generated file: {path.name}",
+                        )
+                    else:
+                        await send_document(
+                            target_chat_id,
+                            path,
+                            caption=f"Generated file: {path.name}",
+                            message_thread_id=message_thread_id,
+                        )
                 except Exception as error:
                     LOG.warning("Could not deliver generated file %s: %s", path, error)
                     try:
-                        await send_message(
-                            target_chat_id,
-                            f"Could not send generated file {path.name}: {error}",
+                        await send_thread_message(
+                            f"Could not send generated file {path.name}: {error}"
                         )
                     except Exception as notify_error:
                         LOG.warning("Could not deliver generated-file error message: %s", notify_error)
@@ -836,6 +894,16 @@ def format_goal(goal):
         if isinstance(token_budget, int):
             usage += f" / {token_budget:,}"
     return f"Goal ({status}):\n{objective}{usage}"
+
+
+def telegram_session_key(message):
+    """Return one independent session key for each chat topic."""
+    chat_id = message.get("chat", {}).get("id")
+    thread_id = message.get("message_thread_id")
+    if thread_id is None and message.get("is_topic_message"):
+        # The General topic can be marked as a topic without a routing ID.
+        thread_id = 1
+    return chat_id, thread_id
 
 
 class CodexAppServer:
@@ -1352,13 +1420,19 @@ class CodexAppServer:
 
 async def main():
     offset = 0
-    codex = CodexAppServer()
-    running_task = None
-    pending_selection = None
-    memory_guard_task = None
+    sessions = {}
+
+    async def create_session():
+        codex = CodexAppServer()
+        await codex.start()
+        return {
+            "codex": codex,
+            "running_task": None,
+            "pending_selection": None,
+        }
+
     await telegram("deleteWebhook", {"drop_pending_updates": "false"})
-    await codex.start()
-    memory_guard_task = asyncio.create_task(monitor_cgroup_oom(codex))
+    memory_guard_task = asyncio.create_task(monitor_cgroup_oom(sessions))
 
     try:
         while True:
@@ -1381,11 +1455,35 @@ async def main():
                     if chat_id != ALLOWED_CHAT_ID:
                         continue
 
+                    message_thread_id = message.get("message_thread_id")
+                    session_key = telegram_session_key(message)
+                    session_thread_id = session_key[1]
+
+                    async def reply(text, citation_sources=None):
+                        if message_thread_id is None:
+                            return await send_message(chat_id, text, citation_sources)
+                        return await send_message(
+                            chat_id,
+                            text,
+                            citation_sources,
+                            message_thread_id=message_thread_id,
+                        )
+
                     attachment_messages = attachment_specs(message)
-                    text = message.get("text") or message.get("caption")
+                    text = message.get("text") or message.get("caption") or ""
                     if not text and not attachment_messages:
-                        await send_message(chat_id, "For now, send me a text message.")
+                        await reply("For now, send me a text message.")
                         continue
+
+                    session = sessions.get(session_key)
+                    if session is None:
+                        try:
+                            session = await create_session()
+                            sessions[session_key] = session
+                        except Exception as error:
+                            await reply(f"Could not start Codex for this topic: {error}")
+                            continue
+                    codex = session["codex"]
 
                     parts = text.strip().split()
                     command = parts[0].split("@")[0].lower() if parts else ""
@@ -1393,20 +1491,19 @@ async def main():
                     argument_text = " ".join(parts[1:])
 
                     if command.startswith("/"):
-                        pending_selection = None
-                    elif pending_selection:
+                        session["pending_selection"] = None
+                    elif session["pending_selection"]:
                         selection = text.strip()
-                        pending = pending_selection
-                        pending_selection = None
+                        pending = session["pending_selection"]
+                        session["pending_selection"] = None
 
                         if pending["kind"] == "permissions":
                             requested_mode = normalize_permission_mode(selection)
                             if not requested_mode:
-                                await send_message(chat_id, "Choose 1, 2, or 3.")
+                                await reply("Choose 1, 2, or 3.")
                             else:
                                 await codex.set_permission_mode(requested_mode)
-                                await send_message(
-                                    chat_id,
+                                await reply(
                                     f"Permissions set to {codex.permission_summary()}. You can send your prompt now.",
                                 )
                             continue
@@ -1414,11 +1511,10 @@ async def main():
                         if pending["kind"] == "thinking":
                             selected_effort = numbered_choice(selection, pending["options"])
                             if selected_effort is None:
-                                await send_message(chat_id, "Choose one of the numbered thinking levels.")
+                                await reply("Choose one of the numbered thinking levels.")
                             else:
                                 codex.current_effort = selected_effort
-                                await send_message(
-                                    chat_id,
+                                await reply(
                                     f"Thinking set to {selected_effort}. You can send your prompt now.",
                                 )
                             continue
@@ -1426,7 +1522,7 @@ async def main():
                         if pending["kind"] == "model":
                             selected = numbered_choice(selection, pending["options"])
                             if selected is None:
-                                await send_message(chat_id, "Choose one of the numbered models.")
+                                await reply("Choose one of the numbered models.")
                             else:
                                 codex.current_model = selected.get("model") or selected.get("id")
                                 supported = {
@@ -1438,8 +1534,7 @@ async def main():
                                     if DEFAULT_REASONING_EFFORT in supported
                                     else selected.get("defaultReasoningEffort")
                                 )
-                                await send_message(
-                                    chat_id,
+                                await reply(
                                     f"Model set to {codex.current_model}. You can send your prompt now.",
                                 )
                             continue
@@ -1447,20 +1542,19 @@ async def main():
                         if pending["kind"] == "resume":
                             selected_thread = numbered_choice(selection, pending["options"])
                             if selected_thread is None:
-                                await send_message(chat_id, "Choose one of the numbered conversations.")
+                                await reply("Choose one of the numbered conversations.")
                             else:
                                 try:
                                     resumed = await codex.resume_thread(selected_thread["id"])
                                 except Exception as error:
-                                    await send_message(chat_id, f"Could not resume conversation: {error}")
+                                    await reply(f"Could not resume conversation: {error}")
                                 else:
                                     title = resumed.get("name") or resumed.get("preview") or resumed["id"]
-                                    await send_message(chat_id, f"Resumed conversation:\n{title}")
+                                    await reply(f"Resumed conversation:\n{title}")
                             continue
 
                     if command in ("/start", "/help"):
-                        await send_message(
-                            chat_id,
+                        await reply(
                             "Codex is connected.\n\n"
                             "/model — list models\n"
                             "/model MODEL_ID — select a model\n"
@@ -1484,15 +1578,14 @@ async def main():
                     if command == "/fast":
                         codex.fast_mode = not codex.fast_mode
                         state = "enabled" if codex.fast_mode else "disabled"
-                        await send_message(
-                            chat_id,
+                        await reply(
                             f"Fast mode {state}. Applies to the next turn.",
                         )
                         continue
 
                     if command in {"/permissions", "/permission"}:
-                        if running_task and not running_task.done():
-                            await send_message(chat_id, "Stop the current task before changing permissions.")
+                        if session["running_task"] and not session["running_task"].done():
+                            await reply("Stop the current task before changing permissions.")
                             continue
 
                         if not argument_text:
@@ -1506,45 +1599,44 @@ async def main():
                                 lines.append(f"{mode['number']}. {mode['label']}{marker}")
                                 lines.append(f"   {mode['description']}")
                             lines.append("\nReply with 1, 2, or 3 to choose.")
-                            pending_selection = {"kind": "permissions"}
-                            await send_message(chat_id, "\n".join(lines))
+                            session["pending_selection"] = {"kind": "permissions"}
+                            await reply("\n".join(lines))
                             continue
 
                         requested_mode = normalize_permission_mode(argument_text)
                         if requested_mode:
                             await codex.set_permission_mode(requested_mode)
-                            await send_message(
-                                chat_id,
+                            await reply(
                                 f"Permissions set to {codex.permission_summary()}. You can send your prompt now.",
                             )
                             continue
 
-                        await send_message(chat_id, "Choose 1, 2, or 3. Send /permissions to list the three choices.")
+                        await reply("Choose 1, 2, or 3. Send /permissions to list the three choices.")
                         continue
 
                     if command in {"/compact", "/compact_context"}:
-                        if running_task and not running_task.done():
-                            await send_message(chat_id, "Stop the current task before compacting context.")
+                        if session["running_task"] and not session["running_task"].done():
+                            await reply("Stop the current task before compacting context.")
                             continue
-                        await send_message(chat_id, "Compacting the current context...")
+                        await reply("Compacting the current context...")
                         try:
                             await codex.compact_thread()
-                            await send_message(chat_id, "Context compacted.")
+                            await reply("Context compacted.")
                         except Exception as error:
-                            await send_message(chat_id, f"Could not compact context: {error}")
+                            await reply(f"Could not compact context: {error}")
                         continue
 
                     if command in {"/goal", "/goals"}:
-                        if running_task and not running_task.done():
-                            await send_message(chat_id, "Stop the current task before changing its goal.")
+                        if session["running_task"] and not session["running_task"].done():
+                            await reply("Stop the current task before changing its goal.")
                             continue
                         goal_argument = argument_text.strip()
                         try:
                             if not goal_argument or goal_argument.lower() in {"status", "show"}:
-                                await send_message(chat_id, format_goal(await codex.get_goal()))
+                                await reply(format_goal(await codex.get_goal()))
                             elif goal_argument.lower() in {"clear", "delete", "off", "none"}:
                                 await codex.clear_goal()
-                                await send_message(chat_id, "Goal cleared.")
+                                await reply("Goal cleared.")
                             else:
                                 normalized_status = goal_argument.lower().replace("-", "").replace("_", "")
                                 status_aliases = {
@@ -1558,18 +1650,18 @@ async def main():
                                 if normalized_status in status_aliases:
                                     current_goal = await codex.get_goal()
                                     if not current_goal:
-                                        await send_message(chat_id, "No goal is set. Use /goal OBJECTIVE first.")
+                                        await reply("No goal is set. Use /goal OBJECTIVE first.")
                                     else:
                                         goal = await codex.set_goal(
                                             current_goal["objective"],
                                             status_aliases[normalized_status],
                                         )
-                                        await send_message(chat_id, format_goal(goal))
+                                        await reply(format_goal(goal))
                                 else:
                                     goal = await codex.set_goal(goal_argument)
-                                    await send_message(chat_id, format_goal(goal))
+                                    await reply(format_goal(goal))
                         except Exception as error:
-                            await send_message(chat_id, f"Could not update goal: {error}")
+                            await reply(f"Could not update goal: {error}")
                         continue
 
                     if command == "/model":
@@ -1580,9 +1672,8 @@ async def main():
                                 model_id = model.get("model") or model.get("id")
                                 marker = " ✓" if model_id == codex.current_model else ""
                                 model_lines.append(f"{index}. {model_id}{marker}")
-                            pending_selection = {"kind": "model", "options": codex.models}
-                            await send_message(
-                                chat_id,
+                            session["pending_selection"] = {"kind": "model", "options": codex.models}
+                            await reply(
                                 "Available models:\n" + "\n".join(model_lines)
                                 + "\n\nReply with the model number to choose.",
                             )
@@ -1599,7 +1690,7 @@ async def main():
                                 None,
                             )
                         if not selected:
-                            await send_message(chat_id, "Unknown model. Send /model to list models.")
+                            await reply("Unknown model. Send /model to list models.")
                             continue
 
                         codex.current_model = selected.get("model") or selected.get("id")
@@ -1612,8 +1703,7 @@ async def main():
                             if DEFAULT_REASONING_EFFORT in supported
                             else selected.get("defaultReasoningEffort")
                         )
-                        await send_message(
-                            chat_id,
+                        await reply(
                             f"Model set to {codex.current_model}.\n"
                             f"Thinking set to {codex.current_effort or 'default'}.\n"
                             "The change applies to the next message.",
@@ -1628,9 +1718,8 @@ async def main():
                                 for index, effort in enumerate(efforts, 1)
                             ]
                             if efforts:
-                                pending_selection = {"kind": "thinking", "options": efforts}
-                            await send_message(
-                                chat_id,
+                                session["pending_selection"] = {"kind": "thinking", "options": efforts}
+                            await reply(
                                 "Supported thinking levels for "
                                 f"{codex.current_model}:\n"
                                 + ("\n".join(effort_lines) or "Default only")
@@ -1640,63 +1729,59 @@ async def main():
 
                         selected_effort = numbered_choice(argument, efforts) or argument
                         if selected_effort not in efforts:
-                            await send_message(
-                                chat_id,
+                            await reply(
                                 "Unsupported thinking level. Send /think to list valid levels.",
                             )
                             continue
 
                         codex.current_effort = selected_effort
-                        await send_message(
-                            chat_id,
+                        await reply(
                             f"Thinking set to {selected_effort}. You can send your prompt now.",
                         )
                         continue
 
                     if command in STATUS_COMMANDS:
                         try:
-                            await send_message(chat_id, await codex.status_text())
+                            await reply(await codex.status_text())
                         except Exception as error:
-                            await send_message(chat_id, f"Could not read status: {error}")
+                            await reply(f"Could not read status: {error}")
                         continue
 
                     if command == "/stop":
                         try:
                             stopped = await codex.interrupt()
-                            await send_message(
-                                chat_id,
+                            await reply(
                                 "Stopping the current task..." if stopped else "No task is running.",
                             )
                         except Exception as error:
-                            await send_message(chat_id, f"Could not stop task: {error}")
+                            await reply(f"Could not stop task: {error}")
                         continue
 
                     if command == "/new":
-                        if running_task and not running_task.done():
-                            await send_message(chat_id, "Stop the current task with /stop first.")
+                        if session["running_task"] and not session["running_task"].done():
+                            await reply("Stop the current task with /stop first.")
                             continue
                         await codex.new_thread()
-                        await send_message(
-                            chat_id,
+                        await reply(
                             "Started a new conversation with "
                             f"{codex.current_model} ({codex.current_effort or 'default'} thinking).",
                         )
                         continue
 
                     if command == "/resume":
-                        if running_task and not running_task.done():
-                            await send_message(chat_id, "Stop the current task with /stop first.")
+                        if session["running_task"] and not session["running_task"].done():
+                            await reply("Stop the current task with /stop first.")
                             continue
 
                         if not argument:
                             try:
                                 threads = await codex.list_threads()
                             except Exception as error:
-                                await send_message(chat_id, f"Could not list conversations: {error}")
+                                await reply(f"Could not list conversations: {error}")
                                 continue
 
                             if not threads:
-                                await send_message(chat_id, "No saved conversations were found.")
+                                await reply("No saved conversations were found.")
                                 continue
 
                             lines = ["Recent conversations:"]
@@ -1708,22 +1793,21 @@ async def main():
                                 current = " (current)" if thread.get("id") == codex.thread_id else ""
                                 lines.append(f"{index}. {title} — {when}{current}")
                             lines.append("\nReply with the conversation number to resume.")
-                            pending_selection = {"kind": "resume", "options": codex.resume_choices}
-                            await send_message(chat_id, "\n".join(lines))
+                            session["pending_selection"] = {"kind": "resume", "options": codex.resume_choices}
+                            await reply("\n".join(lines))
                             continue
 
                         try:
                             selection = int(argument)
                         except ValueError:
-                            await send_message(chat_id, "Use /resume first, then /resume NUMBER.")
+                            await reply("Use /resume first, then /resume NUMBER.")
                             continue
 
                         if not codex.resume_choices:
-                            await send_message(chat_id, "Send /resume first to load the conversation list.")
+                            await reply("Send /resume first to load the conversation list.")
                             continue
                         if selection < 1 or selection > len(codex.resume_choices):
-                            await send_message(
-                                chat_id,
+                            await reply(
                                 f"Choose a number from 1 to {len(codex.resume_choices)}.",
                             )
                             continue
@@ -1732,33 +1816,40 @@ async def main():
                         try:
                             resumed = await codex.resume_thread(selected_thread["id"])
                         except Exception as error:
-                            await send_message(chat_id, f"Could not resume conversation: {error}")
+                            await reply(f"Could not resume conversation: {error}")
                             continue
                         title = resumed.get("name") or resumed.get("preview") or resumed["id"]
-                        await send_message(chat_id, f"Resumed conversation:\n{title}")
+                        await reply(f"Resumed conversation:\n{title}")
                         continue
 
-                    if running_task and not running_task.done():
-                        await send_message(
-                            chat_id,
+                    if session["running_task"] and not session["running_task"].done():
+                        await reply(
                             "Codex is already working. Use /status or /stop.",
                         )
                         continue
 
                     if attachment_messages:
                         try:
-                            saved_attachments = await save_attachments(message)
+                            saved_attachments = await save_attachments(
+                                message,
+                                attachment_folder_for_thread(session_thread_id),
+                            )
                         except Exception as error:
                             LOG.warning("Could not save Telegram attachments: %s", error)
-                            await send_message(
-                                chat_id,
+                            await reply(
                                 f"Could not save the Telegram attachment(s): {error}",
                             )
                             continue
                         text = prompt_with_attachments(text, saved_attachments)
 
-                    running_task = asyncio.create_task(
-                        run_prompt_with_progress(codex, text, chat_id)
+                    session["running_task"] = asyncio.create_task(
+                        run_prompt_with_progress(
+                            codex,
+                            text,
+                            chat_id,
+                            message_thread_id,
+                            session_thread_id,
+                        )
                     )
 
             except Exception as error:
@@ -1771,7 +1862,8 @@ async def main():
                 await memory_guard_task
             except asyncio.CancelledError:
                 pass
-        await codex.close()
+        for session in sessions.values():
+            await session["codex"].close()
 
 
 if __name__ == "__main__":

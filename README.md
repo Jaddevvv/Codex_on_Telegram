@@ -1,8 +1,15 @@
 # Codex on Telegram
 
-Control the Codex CLI from one private Telegram chat. The bridge runs the Codex app server locally, keeps conversation state, streams useful progress into a single edited Telegram message, and removes that temporary progress message when the turn finishes.
+Control the Codex CLI from one allowed Telegram chat. The bridge runs the Codex app server locally, keeps conversation state, streams useful progress into a single edited Telegram message, and removes that temporary progress message when the turn finishes.
 
 The project uses Telegram long polling, Python's standard library, and your existing Codex CLI login. It does not require a webhook, public server, Telegram framework, or separate OpenAI API key.
+
+In Telegram forum or bot topic mode, the bridge detects each message's topic
+and keeps a separate Codex conversation, command selection, and active task for
+that topic. Messages without a topic continue to use one conversation as
+before. Topic conversations use the configured `CODEX_WORKSPACE` directory;
+their Telegram uploads and generated files are kept under
+`attachment/telegram_topics/<topic-id>/`.
 
 ## Features
 
@@ -20,6 +27,7 @@ The project uses Telegram long polling, Python's standard library, and your exis
 - Inspect task, context, and subscription-limit status with `/status` or `/usage`.
 - Stop an active turn, start a new conversation, or resume a recent conversation.
 - Restrict access to one Telegram chat ID.
+- Keep Codex conversation state separate across Telegram topics automatically.
 - Split long responses into Telegram-safe chunks.
 
 ## Requirements
