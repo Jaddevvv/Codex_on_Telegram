@@ -26,6 +26,7 @@ their Telegram uploads and generated files are kept under
 - Set, inspect, pause, complete, or clear a durable thread goal with `/goal`.
 - Inspect task, context, and subscription-limit status with `/status` or `/usage`.
 - Stop an active turn, start a new conversation, or resume a recent conversation.
+- Automatically title new conversations after the first message with GPT-6-Luna at medium reasoning; this can be controlled per Telegram topic.
 - Restrict access to one Telegram chat ID.
 - Keep Codex conversation state separate across Telegram topics automatically.
 - Split long responses into Telegram-safe chunks.
@@ -85,7 +86,11 @@ Start the bridge:
 | `/goal clear` | Remove the current durable goal. |
 | `/status`, `/usage`, `/debug` | Show the model, reasoning level, active task, context use, and rate limits. |
 | `/stop` | Interrupt the active turn. |
-| `/new` | Start a fresh Codex conversation. |
+| `/thread-naming` | Toggle automatic conversation titles for this Telegram topic. |
+| `/thread-naming on\|off` | Explicitly enable or disable automatic titles for this topic. |
+| `/thread-naming status` | Show whether automatic titles are enabled for this topic. |
+| `/new [NAME]` | Start a fresh conversation; optionally set its title. If automatic naming is enabled, an unnamed conversation is titled after its first message. |
+| `/rename NAME` | Rename the current conversation and Telegram topic. |
 | `/resume` | List recent conversations. |
 | `/resume NUMBER` | Resume a listed conversation. |
 
