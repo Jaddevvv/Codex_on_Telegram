@@ -67,6 +67,27 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(bot.numbered_choice("2", ["low", "medium", "high"]), "medium")
         self.assertIsNone(bot.numbered_choice("4", ["low", "medium", "high"]))
 
+    def test_model_menu_includes_live_thinking_levels(self):
+        model = {
+            "id": "gpt-6-astra",
+            "displayName": "GPT-6-Astra",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low"},
+                {"reasoningEffort": "medium"},
+                {"reasoningEffort": "max"},
+                {"reasoningEffort": "max"},
+            ],
+        }
+
+        self.assertEqual(
+            bot.model_supported_efforts(model),
+            ["low", "medium", "max"],
+        )
+        self.assertEqual(
+            bot.model_menu_line(model, "gpt-6-astra"),
+            "GPT-6-Astra (gpt-6-astra) — thinking: low, medium, max ✓",
+        )
+
     def test_format_goal_handles_empty_goal(self):
         self.assertIn("No goal is set", bot.format_goal(None))
 
@@ -398,6 +419,23 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodexStatusTests(unittest.TestCase):
+    def test_memory_snapshot_reads_cgroup_limits_and_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cgroup = bot.Path(directory)
+            (cgroup / "memory.current").write_text("123456789\n")
+            (cgroup / "memory.high").write_text("1073741824\n")
+            (cgroup / "memory.max").write_text("1610612736\n")
+            (cgroup / "memory.swap.max").write_text("0\n")
+            (cgroup / "memory.events").write_text("high 4\nmax 2\noom 1\noom_kill 1\n")
+
+            snapshot = bot.read_memory_snapshot(cgroup)
+
+        self.assertEqual(snapshot["memory.current"], 123456789)
+        self.assertEqual(snapshot["memory.max"], 1610612736)
+        self.assertEqual(snapshot["memory.swap.max"], 0)
+        self.assertEqual(snapshot["events"]["oom_kill"], 1)
+        self.assertIn("118 MiB", bot.format_bytes(snapshot["memory.current"]))
+
     def test_usage_is_a_status_alias(self):
         self.assertEqual(bot.STATUS_COMMANDS, {"/status", "/debug", "/usage"})
 
@@ -421,8 +459,15 @@ class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
             return_value={
                 "data": [
                     {
-                        "model": "gpt-5.6-luna",
-                        "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+                        "model": "gpt-6-luna",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "low"},
+                            {"reasoningEffort": "medium"},
+                            {"reasoningEffort": "high"},
+                            {"reasoningEffort": "xhigh"},
+                            {"reasoningEffort": "max"},
+                            {"reasoningEffort": "ultra"},
+                        ],
                     },
                     {"model": "other-model", "isDefault": True},
                 ]
@@ -431,7 +476,7 @@ class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await server.refresh_models()
 
-        self.assertEqual(server.current_model, "gpt-5.6-luna")
+        self.assertEqual(server.current_model, "gpt-6-luna")
         self.assertEqual(server.current_effort, "xhigh")
         self.assertEqual(server.permission_mode, "full")
         self.assertEqual(

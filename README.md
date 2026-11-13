@@ -1,8 +1,15 @@
 # Codex on Telegram
 
-Control the Codex CLI from one private Telegram chat. The bridge runs the Codex app server locally, keeps conversation state, streams useful progress into a single edited Telegram message, and removes that temporary progress message when the turn finishes.
+Control the Codex CLI from one allowed Telegram chat. The bridge runs the Codex app server locally, keeps conversation state, streams useful progress into a single edited Telegram message, and removes that temporary progress message when the turn finishes.
 
 The project uses Telegram long polling, Python's standard library, and your existing Codex CLI login. It does not require a webhook, public server, Telegram framework, or separate OpenAI API key.
+
+In Telegram forum or bot topic mode, the bridge detects each message's topic
+and keeps a separate Codex conversation, command selection, and active task for
+that topic. Messages without a topic continue to use one conversation as
+before. Topic conversations use the configured `CODEX_WORKSPACE` directory;
+their Telegram uploads and generated files are kept under
+`attachment/telegram_topics/<topic-id>/`.
 
 ## Features
 
@@ -11,15 +18,18 @@ The project uses Telegram long polling, Python's standard library, and your exis
 - Send generated files back as Telegram document attachments, including CSV, Word, PDF, image, and ZIP files.
 - See live progress in one message that is edited as work advances.
 - Automatically delete the progress message after the final answer or error.
-- Start new conversations with GPT-5.6-Luna at extra-high reasoning and Full Access permissions.
+- Start new conversations with GPT-6-Astra at extra-high reasoning and Full Access permissions.
 - Select a Codex model with `/model`.
-- Select supported reasoning effort with `/think`.
+- See each model's live thinking options in `/model` and select one with `/think`.
 - Choose approval and sandbox behavior with `/permissions`.
 - Compact the active context with `/compact`.
 - Set, inspect, pause, complete, or clear a durable thread goal with `/goal`.
 - Inspect task, context, and subscription-limit status with `/status` or `/usage`.
 - Stop an active turn, start a new conversation, or resume a recent conversation.
+- Give conversations custom names with `/new NAME` or rename the current one with `/rename NAME`.
+- Automatically give a new conversation a short AI-generated name after its first prompt.
 - Restrict access to one Telegram chat ID.
+- Keep Codex conversation state separate across Telegram topics automatically.
 - Split long responses into Telegram-safe chunks.
 
 ## Requirements
@@ -43,8 +53,9 @@ Edit `.env`:
 TELEGRAM_BOT_TOKEN=123456789:your_real_bot_token
 ALLOWED_CHAT_ID=123456789
 CODEX_WORKSPACE=/home/me/code
-CODEX_DEFAULT_MODEL=gpt-5.6-luna
+CODEX_DEFAULT_MODEL=gpt-6-luna
 CODEX_DEFAULT_EFFORT=xhigh
+CODEX_DEFAULT_FAST_MODE=false
 CODEX_PERMISSION_MODE=full
 ```
 
@@ -61,7 +72,7 @@ Start the bridge:
 | Command | Action |
 | --- | --- |
 | `/start`, `/help` | Show the command reference. |
-| `/model` | List numbered models; reply with a number to select one. |
+| `/model` | List numbered models with their live thinking levels; reply with a number to select one. |
 | `/model MODEL_ID` | Select a model for subsequent turns. |
 | `/think` | List numbered reasoning levels; reply with a number to select one. |
 | `/think LEVEL` | Select a reasoning level for subsequent turns. |
@@ -77,7 +88,9 @@ Start the bridge:
 | `/goal clear` | Remove the current durable goal. |
 | `/status`, `/usage`, `/debug` | Show the model, reasoning level, active task, context use, and rate limits. |
 | `/stop` | Interrupt the active turn. |
-| `/new` | Start a fresh Codex conversation. |
+| `/new` | Start a fresh conversation; it receives an AI-generated name after your first message. |
+| `/new NAME` | Start a fresh conversation and assign your own name after your first message. |
+| `/rename NAME` | Rename the current conversation. |
 | `/resume` | List recent conversations. |
 | `/resume NUMBER` | Resume a listed conversation. |
 
@@ -95,10 +108,17 @@ Files created or modified in `attachment/` during a successful Codex turn are se
 | `ALLOWED_CHAT_ID` | Yes | — | The only Telegram chat allowed to control Codex. |
 | `CODEX_BIN` | No | `/root/.local/bin/codex` | Path to the Codex executable. |
 | `CODEX_WORKSPACE` | No | `~/codex-workspace` | Working directory and writable root provided to Codex. |
-| `CODEX_DEFAULT_MODEL` | No | `gpt-5.6-luna` | Model selected for new conversations when available. |
+| `CODEX_DEFAULT_MODEL` | No | `gpt-6-luna` | Model selected for new conversations when available. |
 | `CODEX_DEFAULT_EFFORT` | No | `xhigh` | Preferred reasoning effort when supported by the model. |
+| `CODEX_DEFAULT_FAST_MODE` | No | `false` | Start new turns in Fast service tier when set to `true`. |
 | `CODEX_PERMISSION_MODE` | No | `full` | Initial mode: `1` (ask), `2` (approve for me), or `3` (full access). |
 | `CODEX_EVENT_LOG` | No | `/root/codex-telegram/events.log` | Private app-server event log path. |
+
+The live service applies a memory guard: research children are throttled above
+1 GiB and hard-capped at 1.5 GiB, with numeric worker threads limited to one.
+An independent `codex-telegram-oom-watch.service` watches the service cgroup
+and sends an alert to the allowed Telegram chat if the hard cap ever kills a
+worker. The watcher also keeps a local `oom_watch.log` for diagnosis.
 
 Restart the bridge after changing `.env`.
 

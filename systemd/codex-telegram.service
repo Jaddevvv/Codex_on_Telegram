@@ -2,12 +2,27 @@
 Description=Codex on Telegram
 After=network-online.target
 Wants=network-online.target
+Wants=codex-telegram-oom-watch.service
 
 [Service]
 Type=simple
 # Replace both paths with the directory where you cloned this repository.
 WorkingDirectory=/home/YOUR_USER/Codex_on_Telegram
 ExecStart=/home/YOUR_USER/Codex_on_Telegram/run.sh
+# Keep research children inside a bounded cgroup so a large NumPy/Numba job
+# cannot consume the VPS and kill the Telegram bridge or unrelated services.
+MemoryHigh=1G
+MemoryMax=1536M
+MemorySwapMax=0
+OOMPolicy=continue
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
+Environment=NUMBA_NUM_THREADS=1
+Environment=VECLIB_MAXIMUM_THREADS=1
+Environment=BLIS_NUM_THREADS=1
 Restart=on-failure
 RestartSec=5
 

@@ -3,5 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 events.log
+oom_watch.state
+oom_watch.log
 attachment/
 .DS_Store
