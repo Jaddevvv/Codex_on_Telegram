@@ -16,6 +16,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import claude_backend
+except ImportError as _claude_import_error:  # Codex keeps working without it.
+    claude_backend = None
+    CLAUDE_IMPORT_ERROR = _claude_import_error
+else:
+    CLAUDE_IMPORT_ERROR = None
+
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
@@ -1193,6 +1201,7 @@ class CodexAppServer:
     """
 
     display_name = "Codex"
+    provider = "codex"
 
     def __init__(self):
         self.process = None
@@ -1959,7 +1968,6 @@ class CodexAppServer:
             f"Task running: {'yes' if self.active_turn_id else 'no'}",
             f"Last event: {self.last_event} ({event_age})",
             self.context_status(),
-            memory_guard_status(),
             "",
             "Subscription limits:",
         ]
@@ -1993,7 +2001,9 @@ class CodexAppServer:
 
 
 DEFAULT_PROVIDER = "codex"
-PROVIDER_LABELS = {"codex": "Codex"}
+PROVIDER_LABELS = {"codex": "Codex", "claude": "Claude"}
+# Commands that switch the current topic to another provider.
+PROVIDER_COMMANDS = {"/codex": "codex", "/claude": "claude"}
 
 # What the Telegram layer (handle_update, run_conversation,
 # run_prompt_with_progress, monitor_cgroup_oom) uses from session["codex"].
@@ -2026,6 +2036,10 @@ BACKEND_REQUIRED = (
     "current_model",  # str: shown in /new and /model replies
     "current_effort",  # str | None
 )
+# Optional extras: display_name (label in replies), provider ("codex"/"claude":
+# picks the /model default effort), permission_modes (replaces the Codex
+# /permissions descriptions) and on_background_output (async callback, set by
+# the bot, for output of turns the agent starts by itself).
 # Optional commands: hidden behind the backend attribute named here.
 OPTIONAL_COMMAND_ATTRIBUTES = {
     "/model": "refresh_models",  # + models, current_model, current_effort
@@ -2046,7 +2060,63 @@ def create_backend(provider=DEFAULT_PROVIDER):
     """Return an unstarted agent backend for a provider name."""
     if provider == "codex":
         return CodexAppServer()
+    if provider == "claude":
+        if claude_backend is None:
+            raise RuntimeError(f"claude_backend.py could not be imported: {CLAUDE_IMPORT_ERROR}")
+        return claude_backend.ClaudeCodeSession(cwd=WORKSPACE)
     raise ValueError(f"Unknown agent provider: {provider}")
+
+
+def parse_new_arguments(argument_text):
+    """Split "/new [claude|codex] [NAME]" into (provider, name).
+
+    A first word that is exactly a provider name selects it; everything else
+    is the conversation name, as before (so "/new codex Claude ideas" names a
+    Codex conversation "Claude ideas").
+    """
+    words = str(argument_text or "").split()
+    if words and words[0].lower() in PROVIDER_LABELS:
+        return words[0].lower(), " ".join(words[1:])
+    return DEFAULT_PROVIDER, " ".join(words)
+
+
+def preferred_effort(backend, model):
+    """Thinking level to use after selecting ``model`` with /model."""
+    supported = {
+        effort.get("reasoningEffort")
+        for effort in model.get("supportedReasoningEfforts", [])
+    }
+    if getattr(backend, "provider", "codex") == "claude" and claude_backend is not None:
+        preferred = claude_backend.CLAUDE_DEFAULT_EFFORT
+    else:
+        preferred = DEFAULT_REASONING_EFFORT
+    if preferred in supported:
+        return preferred
+    return model.get("defaultReasoningEffort") or (preferred if not supported else None)
+
+
+async def apply_permission_choice(backend, value):
+    """Apply a /permissions choice (1/2/3, ask/approve/full); False if invalid.
+
+    Backends with their own ``permission_modes`` also get raw mode names.
+    """
+    requested = normalize_permission_mode(value)
+    if requested is None and getattr(backend, "permission_modes", None):
+        requested = str(value or "").strip()
+    if not requested:
+        return False
+    try:
+        await backend.set_permission_mode(requested)
+    except ValueError:
+        return False
+    return True
+
+
+def describe_backend(backend):
+    return (
+        f"{backend_name(backend)}: {backend.current_model} "
+        f"({backend.current_effort or 'default'} thinking)"
+    )
 
 
 def new_conversation(session_key, name=None, folder=None, prompted=False):
@@ -2068,6 +2138,7 @@ def conversation_status(session):
         f"Working directory: {getattr(session['codex'], 'cwd', WORKSPACE)}",
         f"Files waiting for your next message: {len(session['pending_attachments'])}",
         f"Queued messages: {len(session['queued_prompts'])}",
+        memory_guard_status(),
     ]
     return "\n".join(lines)
 
@@ -2099,9 +2170,48 @@ async def main():
         update_tasks[key] = task
         return task
 
-    async def create_session(session_key, provider=DEFAULT_PROVIDER):
+    async def start_backend(provider, chat_id, message_thread_id):
         backend = create_backend(provider)
+        if hasattr(backend, "on_background_output"):
+            # Turns the agent starts by itself (e.g. a background task ended).
+            reply = make_reply(chat_id, message_thread_id)
+
+            async def background_output(text):
+                await reply(f"🔔 {backend_name(backend)} (background task):\n\n{text}")
+
+            backend.on_background_output = background_output
         await backend.start()
+        return backend
+
+    async def close_backend(backend):
+        try:
+            await backend.close()
+        except Exception:
+            LOG.exception("Could not close the %s backend", backend_name(backend))
+
+    async def replace_backend(session, session_key, provider, chat_id, message_thread_id):
+        """Close the session's backend (freeing its memory), then start ``provider``."""
+        previous_provider = session["provider"]
+        await close_backend(session["codex"])
+        try:
+            backend = await start_backend(provider, chat_id, message_thread_id)
+        except Exception:
+            LOG.exception("Could not start the %s backend", provider)
+            try:
+                session["codex"] = await start_backend(
+                    previous_provider, chat_id, message_thread_id
+                )
+            except Exception:
+                LOG.exception("Could not restart the %s backend", previous_provider)
+                # The next message for this topic starts a fresh session.
+                sessions.pop(session_key, None)
+            raise
+        session["codex"] = backend
+        session["provider"] = provider
+        return backend
+
+    async def create_session(session_key, chat_id, message_thread_id, provider=DEFAULT_PROVIDER):
+        backend = await start_backend(provider, chat_id, message_thread_id)
         return {
             "codex": backend,
             "provider": provider,
@@ -2302,6 +2412,43 @@ async def main():
             if batch["files"] or batch["captions"]:
                 arm_attachment_batch(session, session_key)
 
+    async def switch_provider(session, session_key, provider, chat_id, message_thread_id, reply):
+        """Move this topic to another provider, keeping folder and pending files."""
+        label = PROVIDER_LABELS[provider]
+        if task_running(session):
+            await reply(f"A task is running — /stop first, then /{provider}.")
+            return
+        if session["provider"] == provider:
+            await reply(f"Already using {describe_backend(session['codex'])}.")
+            return
+        if provider == "claude" and claude_backend is None:
+            await reply(f"Claude is not available: {CLAUDE_IMPORT_ERROR}")
+            return
+        conversation = session["conversation"]
+        old_backend = session["codex"]
+        pending_name = None if conversation["prompted"] else old_backend.pending_thread_name
+        try:
+            backend = await replace_backend(
+                session, session_key, provider, chat_id, message_thread_id
+            )
+            # A conversation that started with files keeps working in its folder.
+            cwd = str(conversation["folder"]) if conversation["files_first"] else WORKSPACE
+            await backend.new_thread(pending_name, cwd=cwd)
+        except Exception as error:
+            await reply(f"Could not switch to {label}: {error}")
+            return
+        conversation["prompted"] = False
+        session["queued_prompts"] = []
+        remember_thread_conversation(backend.thread_id, conversation["folder"], backend.cwd)
+        pending = len(session["pending_attachments"])
+        notes = [f"Switched to {describe_backend(backend)}.",
+                 f"New conversation, same folder: {conversation['folder']}"]
+        if pending:
+            notes.append(
+                f"{pending} pending file{'' if pending == 1 else 's'} will go with your next message."
+            )
+        await reply("\n".join(notes))
+
     async def resume_conversation(session, session_key, selected_thread, reply):
         codex = session["codex"]
         try:
@@ -2378,12 +2525,21 @@ async def main():
         if command == "/new":
             await reply("Preparing your new conversation...")
 
+        created_now = False
         if session is None:
+            # /claude, /codex and "/new claude" start with that provider directly.
+            if command == "/new":
+                initial_provider = parse_new_arguments(argument_text)[0]
+            else:
+                initial_provider = PROVIDER_COMMANDS.get(command, DEFAULT_PROVIDER)
             try:
-                session = await create_session(session_key)
+                session = await create_session(
+                    session_key, chat_id, message_thread_id, initial_provider
+                )
                 sessions[session_key] = session
+                created_now = True
             except Exception as error:
-                label = PROVIDER_LABELS.get(DEFAULT_PROVIDER, "the agent")
+                label = PROVIDER_LABELS.get(initial_provider, "the agent")
                 await reply(f"Could not start {label} for this topic: {error}")
                 return
         codex = session["codex"]
@@ -2393,6 +2549,21 @@ async def main():
             await handle_attachments(
                 session, session_key, message, text, chat_id, message_thread_id, reply
             )
+            return
+
+        if command in PROVIDER_COMMANDS:
+            session["pending_selection"] = None
+            if created_now:
+                await reply(f"Using {describe_backend(codex)}.")
+            else:
+                await switch_provider(
+                    session,
+                    session_key,
+                    PROVIDER_COMMANDS[command],
+                    chat_id,
+                    message_thread_id,
+                    reply,
+                )
             return
 
         if command in OPTIONAL_COMMAND_ATTRIBUTES and not hasattr(
@@ -2410,14 +2581,12 @@ async def main():
             session["pending_selection"] = None
 
             if pending["kind"] == "permissions":
-                requested_mode = normalize_permission_mode(selection)
-                if not requested_mode:
-                    await reply("Choose 1, 2, or 3.")
-                else:
-                    await codex.set_permission_mode(requested_mode)
+                if await apply_permission_choice(codex, selection):
                     await reply(
                         f"Permissions set to {codex.permission_summary()}. You can send your prompt now.",
                     )
+                else:
+                    await reply("Choose 1, 2, or 3.")
                 return
 
             if pending["kind"] == "thinking":
@@ -2437,15 +2606,7 @@ async def main():
                     await reply("Choose one of the numbered models.")
                 else:
                     codex.current_model = selected.get("model") or selected.get("id")
-                    supported = {
-                        effort.get("reasoningEffort")
-                        for effort in selected.get("supportedReasoningEfforts", [])
-                    }
-                    codex.current_effort = (
-                        DEFAULT_REASONING_EFFORT
-                        if DEFAULT_REASONING_EFFORT in supported
-                        else selected.get("defaultReasoningEffort")
-                    )
+                    codex.current_effort = preferred_effort(codex, selected)
                     await reply(
                         f"Model set to {codex.current_model}. You can send your prompt now.",
                     )
@@ -2463,11 +2624,13 @@ async def main():
 
         if command in ("/start", "/help"):
             await reply(
-                f"{backend_name(codex)} is connected.\n\n"
+                f"Connected to {describe_backend(codex)}.\n\n"
                 "Send a message to start a task. Messages sent while a task is "
                 "running are added to it.\n"
                 "Send files without text to stage them: they are saved in this "
                 "conversation's own folder and included with your next message.\n\n"
+                "/codex — switch this conversation to Codex (keeps folder and files)\n"
+                "/claude — switch this conversation to Claude (keeps folder and files)\n"
                 "/model — list models\n"
                 "/model MODEL_ID — select a model\n"
                 "/think — list thinking levels\n"
@@ -2483,7 +2646,8 @@ async def main():
                 "/stop — stop the current task (and drop queued messages)\n"
                 "/resume — list recent conversations\n"
                 "/resume NUMBER — resume it and show its last AI response\n"
-                "/new [NAME] — start a fresh conversation and folder; auto-name it if NAME is omitted\n"
+                "/new [NAME] — start a fresh Codex conversation and folder; auto-name it if NAME is omitted\n"
+                "/new claude [NAME] — the same with Claude\n"
                 "/rename NAME — rename the current conversation",
             )
             return
@@ -2502,12 +2666,13 @@ async def main():
                 return
 
             if not argument_text:
-                current = PERMISSION_MODES[codex.permission_mode]
+                modes = getattr(codex, "permission_modes", None) or PERMISSION_MODES
+                current = modes[codex.permission_mode]
                 lines = [
                     f"Current permissions: {codex.permission_summary()}",
                     "",
                 ]
-                for mode in PERMISSION_MODES.values():
+                for mode in modes.values():
                     marker = " (current)" if mode["number"] == current["number"] else ""
                     lines.append(f"{mode['number']}. {mode['label']}{marker}")
                     lines.append(f"   {mode['description']}")
@@ -2516,9 +2681,7 @@ async def main():
                 await reply("\n".join(lines))
                 return
 
-            requested_mode = normalize_permission_mode(argument_text)
-            if requested_mode:
-                await codex.set_permission_mode(requested_mode)
+            if await apply_permission_choice(codex, argument_text):
                 await reply(
                     f"Permissions set to {codex.permission_summary()}. You can send your prompt now.",
                 )
@@ -2607,15 +2770,7 @@ async def main():
                 return
 
             codex.current_model = selected.get("model") or selected.get("id")
-            supported = {
-                effort.get("reasoningEffort")
-                for effort in selected.get("supportedReasoningEfforts", [])
-            }
-            codex.current_effort = (
-                DEFAULT_REASONING_EFFORT
-                if DEFAULT_REASONING_EFFORT in supported
-                else selected.get("defaultReasoningEffort")
-            )
+            codex.current_effort = preferred_effort(codex, selected)
             await reply(
                 f"Model set to {codex.current_model}.\n"
                 f"Thinking set to {codex.current_effort or 'default'}.\n"
@@ -2658,7 +2813,13 @@ async def main():
                 status = await codex.status_text()
             except Exception as error:
                 status = f"Could not read status: {error}"
-            await reply(f"{status}\n\n{conversation_status(session)}")
+            others = " or ".join(
+                f"/{name}" for name in PROVIDER_LABELS if name != session["provider"]
+            )
+            await reply(
+                f"Provider: {PROVIDER_LABELS[session['provider']]} (switch with {others})\n"
+                f"{status}\n\n{conversation_status(session)}"
+            )
             return
 
         if command == "/stop":
@@ -2682,16 +2843,22 @@ async def main():
             if task_running(session):
                 await reply("Stop the current task with /stop first.")
                 return
+            # /new always starts with Codex unless "/new claude" asks otherwise.
+            provider, name = parse_new_arguments(argument_text)
             try:
-                await codex.new_thread(argument_text or None, cwd=WORKSPACE)
+                if session["provider"] != provider:
+                    codex = await replace_backend(
+                        session, session_key, provider, chat_id, message_thread_id
+                    )
+                await codex.new_thread(name or None, cwd=WORKSPACE)
             except Exception as error:
                 LOG.exception("Could not start a new conversation")
                 await reply(f"Could not start a new conversation: {error}")
                 return
-            start_conversation(session, session_key, name=argument_text or None)
+            start_conversation(session, session_key, name=name or None)
             topic_note = ""
             try:
-                await rename_forum_topic(chat_id, message_thread_id, argument_text or "New conversation")
+                await rename_forum_topic(chat_id, message_thread_id, name or "New conversation")
             except Exception as error:
                 if "message is not modified" not in str(error).lower():
                     LOG.warning("Could not reset the Telegram topic title: %s", error)
@@ -2702,8 +2869,7 @@ async def main():
                 else ""
             )
             await reply(
-                "Started a new conversation with "
-                f"{codex.current_model} ({codex.current_effort or 'default'} thinking)."
+                f"Started a new conversation with {describe_backend(codex)}."
                 f"{title_note}{topic_note}",
             )
             return
@@ -2826,7 +2992,10 @@ async def main():
             except asyncio.CancelledError:
                 pass
         for session in sessions.values():
-            await session["codex"].close()
+            try:
+                await session["codex"].close()
+            except Exception:
+                LOG.exception("Could not close a backend during shutdown")
 
 
 if __name__ == "__main__":
