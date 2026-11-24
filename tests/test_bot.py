@@ -101,31 +101,45 @@ class FormattingTests(unittest.TestCase):
 class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
     def test_changed_attachment_files_returns_only_new_or_modified_files(self):
         with tempfile.TemporaryDirectory() as workspace:
-            attachment_folder = bot.Path(workspace) / "attachment"
+            attachment_folder = bot.Path(workspace) / "outbox"
             attachment_folder.mkdir()
             existing = attachment_folder / "existing.txt"
             existing.write_text("before")
 
-            with patch.object(bot, "WORKSPACE", workspace):
-                before = bot.attachment_file_snapshot()
-                existing.write_text("after")
-                new_file = attachment_folder / "new.docx"
-                new_file.write_bytes(b"document")
-                changed = bot.changed_attachment_files(before)
+            before = bot.attachment_file_snapshot(attachment_folder)
+            existing.write_text("after")
+            new_file = attachment_folder / "new.docx"
+            new_file.write_bytes(b"document")
+            changed = bot.changed_attachment_files(before, attachment_folder)
 
         self.assertEqual(changed, [existing, new_file])
+        self.assertEqual(bot.attachment_file_snapshot(None), {})
 
-    def test_thread_attachment_folders_are_scoped_per_topic(self):
+    def test_conversation_folders_are_scoped_per_topic_and_unique(self):
+        now = bot.datetime(2026, 11, 24, 13, 5, 1)
         with tempfile.TemporaryDirectory() as workspace:
             with patch.object(bot, "WORKSPACE", workspace):
-                regular = bot.attachment_folder_for_thread()
-                topic = bot.attachment_folder_for_thread(456)
+                regular = bot.new_conversation_folder((-100123, None), now=now)
+                topic = bot.new_conversation_folder((-100123, 456), "Research plan!", now=now)
+                again = bot.new_conversation_folder((-100123, 456), "Research plan!", now=now)
 
-        self.assertEqual(regular, bot.Path(workspace) / "attachment")
-        self.assertEqual(
-            topic,
-            bot.Path(workspace) / "attachment" / "telegram_topics" / "456",
-        )
+        root = bot.Path(workspace) / "telegram_sessions"
+        self.assertEqual(regular, root / "chat-100123" / "20261124-130501")
+        self.assertEqual(topic, root / "topic-456" / "20261124-130501-research-plan")
+        self.assertEqual(again, root / "topic-456" / "20261124-130501-research-plan-2")
+        self.assertFalse(regular.exists())
+        self.assertEqual(bot.outbox_folder(topic), topic / "outbox")
+
+    def test_thread_conversation_state_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = bot.Path(directory) / "state.json"
+            with patch.object(bot, "CONVERSATION_STATE_FILE", state):
+                self.assertIsNone(bot.thread_conversation_record("t1"))
+                bot.remember_thread_conversation("t1", "/w/telegram_sessions/topic-1/a", "/w")
+                record = bot.thread_conversation_record("t1")
+
+        self.assertEqual(record["folder"], "/w/telegram_sessions/topic-1/a")
+        self.assertEqual(record["cwd"], "/w")
 
     def test_telegram_upload_document_streams_any_file_as_multipart(self):
         class FakeResponse:
@@ -200,21 +214,23 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    def test_prompt_with_attachments_names_fresh_files_and_ignores_older_files(self):
-        with tempfile.TemporaryDirectory() as workspace:
-            workspace_path = bot.Path(workspace)
-            attachment_path = workspace_path / "attachment" / "fresh report.csv"
+    def test_prompt_with_attachments_lists_exact_absolute_paths(self):
+        first = bot.Path("/w/telegram_sessions/topic-1/a/fresh report.csv")
+        second = bot.Path("/w/telegram_sessions/topic-1/a/notes.docx")
 
-            with patch.object(bot, "WORKSPACE", workspace):
-                prompt = bot.prompt_with_attachments("Analyze this", [attachment_path])
+        prompt = bot.prompt_with_attachments("Analyze this", [first, second])
 
-        self.assertIn("Analyze this", prompt)
-        self.assertIn(
-            "i have sent you attachments in the folder attachment that have been dropped less than a minute ago.",
-            prompt,
-        )
-        self.assertIn("attachment/fresh report.csv", prompt)
-        self.assertIn("ignore older files in that folder", prompt)
+        self.assertTrue(prompt.startswith("Analyze this\n\n"))
+        self.assertIn("2 files", prompt)
+        self.assertIn(f"- fresh report.csv: {first}", prompt)
+        self.assertIn(f"- notes.docx: {second}", prompt)
+        self.assertNotIn("minute", prompt)
+        self.assertEqual(bot.prompt_with_attachments("Just text", []), "Just text")
+
+    def test_readable_attachment_names_keep_letters_and_stay_inside_folder(self):
+        self.assertEqual(bot.readable_attachment_name("../Rapport été.docx", "x"), "Rapport été.docx")
+        self.assertEqual(bot.readable_attachment_name("a/b\\c<d>.txt", "x"), "c_d_.txt")
+        self.assertEqual(bot.readable_attachment_name("..", "fallback"), "fallback")
 
     async def test_save_attachments_creates_attachment_folder_and_downloads_files(self):
         message = {
@@ -223,6 +239,8 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with tempfile.TemporaryDirectory() as workspace:
+            folder = bot.Path(workspace) / "telegram_sessions" / "topic-1" / "conv"
+
             def fake_download(file_path, destination):
                 self.assertEqual(file_path, "documents/report.csv")
                 destination.write_bytes(b"a,b\n1,2\n")
@@ -244,13 +262,14 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
                     new=fake_to_thread,
                 ),
             ):
-                saved = await bot.save_attachments(message)
+                saved = await bot.save_attachments(message, folder)
+                again = await bot.save_attachments(message, folder)
 
             self.assertEqual(len(saved), 1)
-            self.assertEqual(saved[0].parent, bot.Path(workspace) / "attachment")
-            self.assertTrue(saved[0].name.endswith("_report.csv"))
+            self.assertEqual(saved[0], folder / "report.csv")
             self.assertEqual(saved[0].read_bytes(), b"a,b\n1,2\n")
-            telegram_request.assert_awaited_once_with("getFile", {"file_id": "doc-id"})
+            self.assertEqual(again[0], folder / "report (2).csv")
+            telegram_request.assert_awaited_with("getFile", {"file_id": "doc-id"})
 
     def test_split_message_hard_splits_without_separators(self):
         text = "x" * 10_001
@@ -354,7 +373,7 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
                 events.append("typing-stopped")
                 raise
 
-        async def fake_run(prompt):
+        async def fake_run(prompt, title_prompt=None):
             await asyncio.sleep(0)
             return "completed response"
 
@@ -384,7 +403,7 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
             except asyncio.CancelledError:
                 raise
 
-        async def fake_run(prompt):
+        async def fake_run(prompt, title_prompt=None):
             codex.progress_updates.put_nowait("started work")
             await asyncio.sleep(0.9)
             return "completed response"
@@ -421,9 +440,9 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
             except asyncio.CancelledError:
                 raise
 
-        async def fake_run(prompt):
+        async def fake_run(prompt, title_prompt=None):
             events.append(prompt)
-            output = bot.Path(workspace) / "attachment" / "result.docx"
+            output = bot.Path(workspace) / "outbox" / "result.docx"
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(b"generated document")
             return "created the report"
@@ -447,9 +466,14 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "send_message", new=fake_send_message),
                 patch.object(bot, "send_document", new=fake_send_document),
             ):
-                await bot.run_prompt_with_progress(codex, "make a report", 123)
+                await bot.run_prompt_with_progress(
+                    codex,
+                    "make a report",
+                    123,
+                    output_folder=bot.Path(workspace) / "outbox",
+                )
 
-        self.assertIn(bot.OUTBOUND_FILE_PROMPT, events[0])
+        self.assertIn(bot.outbound_file_prompt(bot.Path(workspace) / "outbox"), events[0])
         self.assertEqual(events[1], "created the report")
         self.assertEqual(len(documents), 1)
         self.assertEqual(documents[0][0], 123)
@@ -468,9 +492,9 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
             except asyncio.CancelledError:
                 raise
 
-        async def fake_run(prompt):
+        async def fake_run(prompt, title_prompt=None):
             prompts.append(prompt)
-            output = bot.attachment_folder_for_thread(456) / "topic-result.txt"
+            output = bot.Path(workspace) / "telegram_sessions" / "topic-456" / "c" / "outbox" / "topic-result.txt"
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text("topic file")
             return "topic response"
@@ -483,6 +507,7 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
             documents.append((chat_id, path, caption, message_thread_id))
 
         codex = SimpleNamespace(
+            last_thread_name=None,
             progress_updates=asyncio.Queue(),
             citation_sources={},
             run=fake_run,
@@ -499,10 +524,10 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
                     "do work",
                     123,
                     message_thread_id=456,
-                    session_thread_id=456,
+                    output_folder=bot.Path(workspace) / "telegram_sessions" / "topic-456" / "c" / "outbox",
                 )
 
-        self.assertIn("attachment/telegram_topics/456/", prompts[0])
+        self.assertIn("telegram_sessions/topic-456/c/outbox/", prompts[0])
         self.assertEqual(messages, [(123, "topic response", 456)])
         self.assertEqual(len(documents), 1)
         self.assertEqual(documents[0][0], 123)
@@ -550,8 +575,11 @@ class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
             return_value={
                 "data": [
                     {
-                        "model": "gpt-5.6-luna",
-                        "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+                        "model": bot.DEFAULT_MODEL,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "low"},
+                            {"reasoningEffort": bot.DEFAULT_REASONING_EFFORT},
+                        ],
                     },
                     {"model": "other-model", "isDefault": True},
                 ]
@@ -560,8 +588,8 @@ class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await server.refresh_models()
 
-        self.assertEqual(server.current_model, "gpt-5.6-luna")
-        self.assertEqual(server.current_effort, "xhigh")
+        self.assertEqual(server.current_model, bot.DEFAULT_MODEL)
+        self.assertEqual(server.current_effort, bot.DEFAULT_REASONING_EFFORT)
         self.assertEqual(server.permission_mode, "full")
         self.assertEqual(
             server.thread_permission_params(),
@@ -602,6 +630,51 @@ class CodexThreadCommandTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0] for call in server.request.await_args_list],
             ["thread/compact/start", "thread/goal/get", "thread/goal/set", "thread/goal/clear"],
         )
+
+    async def test_steer_targets_the_active_main_turn(self):
+        server = bot.CodexAppServer()
+        server.thread_id = "thread-1"
+        server.request = AsyncMock(return_value={"turnId": "turn-9"})
+
+        with self.assertRaises(RuntimeError):
+            await server.steer("too early")
+        server.active_turn_id = "turn-title"
+        server.active_turn_thread_id = "title-thread"
+        with self.assertRaises(RuntimeError):
+            await server.steer("not the title turn")
+        server.request.assert_not_awaited()
+
+        server.active_turn_id = "turn-9"
+        server.active_turn_thread_id = "thread-1"
+        self.assertEqual(await server.steer("also do X"), "turn-9")
+        server.request.assert_awaited_once_with(
+            "turn/steer",
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "also do X"}],
+                "expectedTurnId": "turn-9",
+            },
+        )
+
+    async def test_new_thread_uses_cwd_and_reuses_untouched_thread(self):
+        server = bot.CodexAppServer()
+        server.current_model = "m"
+        server.request = AsyncMock(
+            side_effect=[{"thread": {"id": "t1"}}, {"thread": {"id": "t2"}}]
+        )
+
+        await server.new_thread()
+        await server.new_thread("Named")  # untouched, same cwd: reused
+        self.assertEqual((server.thread_id, server.pending_thread_name), ("t1", "Named"))
+        await server.new_thread("Named", cwd="/w/telegram_sessions/topic-1/c")
+
+        self.assertEqual(server.request.await_count, 2)
+        self.assertEqual(server.request.await_args_list[0].args[1]["cwd"], bot.WORKSPACE)
+        self.assertEqual(
+            server.request.await_args_list[1].args[1]["cwd"], "/w/telegram_sessions/topic-1/c"
+        )
+        self.assertEqual(server.thread_id, "t2")
+        self.assertEqual(server.turn_start_params("hi")["cwd"], "/w/telegram_sessions/topic-1/c")
 
 
 if __name__ == "__main__":

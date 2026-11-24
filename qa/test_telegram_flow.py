@@ -47,8 +47,9 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 pass
             def configure_new_thread_state(self, name):
                 self.pending_thread_name = name
-            async def new_thread(self, name=None):
+            async def new_thread(self, name=None, cwd=None):
                 self.pending_thread_name = name
+                self.cwd = cwd
             async def status_text(self):
                 return 'status ready'
 
