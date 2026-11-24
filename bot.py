@@ -21,8 +21,8 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 CODEX_BIN = os.environ.get("CODEX_BIN", "/root/.local/bin/codex")
 WORKSPACE = os.environ.get("CODEX_WORKSPACE", str(Path.home() / "codex-workspace"))
-DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6-luna")
-DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "xhigh")
+DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6.2-sol")
+DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_DEFAULT_EFFORT", "medium")
 DEFAULT_FAST_MODE = os.environ.get("CODEX_DEFAULT_FAST_MODE", "false").strip().lower() in {
     "1",
     "true",
