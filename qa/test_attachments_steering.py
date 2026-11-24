@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -58,6 +59,7 @@ class SteeringFlowTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeBackend:
             display_name = 'FakeAgent'
+            provider = 'codex'
 
             def __init__(self):
                 self.thread_id = None
@@ -75,13 +77,14 @@ class SteeringFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.new_threads = []
                 self.steer_ok = True
                 self.steer_hook = None
+                self.closed = False
                 owner.backends.append(self)
 
             async def start(self):
                 await self.new_thread()
 
             async def close(self):
-                pass
+                self.closed = True
 
             async def new_thread(self, name=None, cwd=None):
                 owner.counter += 1
@@ -137,7 +140,47 @@ class SteeringFlowTests(unittest.IsolatedAsyncioTestCase):
             async def status_text(self):
                 return 'status ok'
 
+        class FakeClaude(FakeBackend):
+            display_name = 'Claude'
+            provider = 'claude'
+            permission_modes = {
+                'ask': {'number': '1', 'label': 'Ask', 'description': 'claude ask'},
+                'approve': {'number': '2', 'label': 'Approve', 'description': 'Claude Code auto mode'},
+                'full': {'number': '3', 'label': 'Full', 'description': 'claude full'},
+            }
+
+            def __init__(self, cwd=None):
+                super().__init__()
+                self.cwd = str(cwd or bot.WORKSPACE)
+                self.current_model = 'claude-opus-5-5'
+                self.current_effort = 'medium'
+                self.permission_mode = 'full'
+                self.on_background_output = None
+                self.models = []
+
+            async def refresh_models(self):
+                self.models = [
+                    {'id': 'claude-opus-5-5', 'model': 'claude-opus-5-5', 'defaultReasoningEffort': 'medium',
+                     'supportedReasoningEfforts': [{'reasoningEffort': e} for e in ('low', 'medium', 'high')]},
+                    {'id': 'claude-haiku-5-5', 'model': 'claude-haiku-5-5', 'defaultReasoningEffort': 'low',
+                     'supportedReasoningEfforts': [{'reasoningEffort': e} for e in ('low', 'medium', 'high')]},
+                ]
+                return self.models
+
+            def supported_efforts(self):
+                return ['low', 'medium', 'high']
+
+            def permission_summary(self):
+                return f"{self.permission_modes[self.permission_mode]['number']}. {self.permission_mode}"
+
+            async def set_permission_mode(self, mode):
+                mode = {'1': 'ask', '2': 'approve', '3': 'full', 'auto': 'approve'}.get(mode, mode)
+                if mode not in self.permission_modes:
+                    raise ValueError(mode)
+                self.permission_mode = mode
+
         self.FakeBackend = FakeBackend
+        self.FakeClaude = FakeClaude
         self.real_backend_class = bot.CodexAppServer
 
         async def telegram(method, values=None, timeout=70):
@@ -178,6 +221,9 @@ class SteeringFlowTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, 'WORKSPACE', str(self.workspace)),
             patch.object(bot, 'CONVERSATION_STATE_FILE', Path(self.tmp.name) / 'state.json'),
             patch.object(bot, 'ATTACHMENT_BATCH_SECONDS', 0.15),
+            # CLAUDE_DEFAULT_EFFORT differs from Codex's default on purpose.
+            patch.object(bot, 'claude_backend', SimpleNamespace(
+                ClaudeCodeSession=FakeClaude, CLAUDE_DEFAULT_EFFORT='high')),
         ]
         for p in self.patches:
             p.start()
@@ -432,6 +478,108 @@ class SteeringFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Saved 1 file', ack)
         backend = self.backend()
         self.assertEqual(Path(backend.cwd) / 'fresh.docx', Path(ack.split('Folder: ')[1].splitlines()[0]) / 'fresh.docx')
+
+
+    # providers -----------------------------------------------------------
+    async def test_claude_switch_keeps_folder_and_files_and_new_returns_to_codex(self):
+        await self.send_doc('spec.txt')
+        self.assertIn('Saved 1 file', await self.receive())
+        codex = self.backend()
+        self.assertEqual(codex.provider, 'codex')
+        folder = Path(codex.cwd)
+        await self.send_text('/claude')
+        switched = await self.receive()
+        self.assertIn('Switched to Claude: claude-opus-5-5 (medium thinking)', switched)
+        self.assertIn(f'same folder: {folder}', switched)
+        self.assertIn('1 pending file', switched)
+        claude = self.backend()
+        self.assertIsInstance(claude, self.FakeClaude)
+        self.assertTrue(codex.closed)
+        self.assertEqual(claude.cwd, str(folder))  # files-first: stays in the folder
+        await self.send_text("what's in the file?")
+        self.assertEqual(await self.receive(), 'answer 1')
+        self.assertIn(str(folder / 'spec.txt'), claude.runs[0]['prompt'])
+        self.assertEqual(codex.runs, [])
+        await self.send_text('/claude')
+        self.assertIn('Already using Claude: claude-opus-5-5', await self.receive())
+        await self.send_text('/new')
+        self.assertIn('Preparing', await self.receive())
+        self.assertIn('Started a new conversation with FakeAgent: fake-model', await self.receive())
+        self.assertTrue(claude.closed)
+        fresh = self.backend()
+        self.assertEqual((fresh.provider, fresh.cwd), ('codex', str(self.workspace)))
+
+    async def test_new_claude_shortcut_and_names(self):
+        await self.send_text('/new claude Research plan')
+        self.assertIn('Preparing', await self.receive())
+        self.assertIn('Started a new conversation with Claude: claude-opus-5-5', await self.receive())
+        self.assertIsInstance(self.backend(), self.FakeClaude)
+        self.assertEqual(self.backend().pending_thread_name, 'Research plan')
+        self.assertEqual(self.renames[-1], (TOPIC, 'Research plan'))
+        await self.send_text('/new codex Claude ideas')
+        await self.receive()
+        self.assertIn('with FakeAgent', await self.receive())
+        self.assertEqual(self.backend().provider, 'codex')
+        self.assertEqual(self.backend().pending_thread_name, 'Claude ideas')
+        await self.send_text('/new Claude')  # a lone provider word selects it
+        await self.receive()
+        self.assertIn('with Claude', await self.receive())
+
+    async def test_provider_switch_refused_while_running_and_steer_goes_to_active(self):
+        self.gate.clear()
+        await self.send_text('Long task')
+        await self.wait_for(lambda: self.backends and self.backend().active_turn_id)
+        codex = self.backend()
+        await self.send_text('/claude')
+        self.assertEqual(await self.receive(), 'A task is running — /stop first, then /claude.')
+        self.assertFalse(codex.closed)
+        await self.send_text('steer me')
+        self.assertIn('Added to the running task', await self.receive())
+        self.assertEqual(codex.steers, ['steer me'])
+        self.gate.set()
+        self.assertEqual(await self.receive(), 'answer 1')
+
+        self.gate.clear()
+        await self.send_text('/claude')
+        self.assertIn('Switched to Claude', await self.receive())
+        claude = self.backend()
+        await self.send_text('Claude task')
+        await self.wait_for(lambda: claude.active_turn_id)
+        await self.send_text('also this')
+        self.assertIn('Added to the running task', await self.receive())
+        self.assertEqual(claude.steers, ['also this'])
+        self.assertEqual(codex.steers, ['steer me'])
+        self.gate.set()
+        self.assertEqual(await self.receive(), 'answer 1')
+
+    async def test_claude_model_think_permissions_status_and_background_output(self):
+        await self.send_text('/claude')
+        self.assertIn('Using Claude: claude-opus-5-5 (medium thinking)', await self.receive())
+        claude = self.backend()
+        await self.send_text('/model')
+        listing = await self.receive()
+        self.assertIn('2. claude-haiku-5-5', listing)
+        await self.send_text('2')
+        self.assertIn('Model set to claude-haiku-5-5', await self.receive())
+        # Claude's default effort (patched to "high"), not Codex's or the model's.
+        self.assertEqual(claude.current_effort, 'high')
+        await self.send_text('/think low')
+        self.assertIn('Thinking set to low', await self.receive())
+        self.assertEqual(claude.current_effort, 'low')
+        await self.send_text('/permissions')
+        self.assertIn('Claude Code auto mode', await self.receive())
+        await self.send_text('2')
+        self.assertIn('Permissions set to 2. approve', await self.receive())
+        await self.send_text('/permissions auto')
+        self.assertIn('Permissions set to 2. approve', await self.receive())
+        await self.send_text('/fast')
+        self.assertEqual(await self.receive(), '/fast is not available with Claude.')
+        await self.send_text('/status')
+        status = await self.receive()
+        self.assertTrue(status.startswith('Provider: Claude (switch with /codex)'))
+        self.assertIn('Memory', status)
+        await claude.on_background_output('background job finished')
+        self.assertEqual(await self.receive(), '🔔 Claude (background task):\n\nbackground job finished')
 
 
 if __name__ == '__main__':
