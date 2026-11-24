@@ -7,3 +7,6 @@ oom_watch.state
 oom_watch.log
 attachment/
 .DS_Store
+conversation_state.json
+conversation_state.json.tmp
+telegram_sessions/
