@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private Telegram bridge for the Codex app server."""
+"""Private Telegram bridge for coding agents (currently the Codex app server)."""
 
 import asyncio
 import http.client
@@ -36,16 +36,26 @@ EVENT_LOG = Path(os.environ.get("CODEX_EVENT_LOG", "/root/codex-telegram/events.
 TELEGRAM_MESSAGE_LIMIT = 4000
 APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
-ATTACHMENT_FOLDER_NAME = "attachment"
+# Every conversation (a fresh one after /new, per chat topic) gets its own folder:
+#   WORKSPACE/telegram_sessions/<topic-N|chat-N>/<YYYYmmdd-HHMMSS>[-name]/
+# Telegram uploads are saved at its top level; files the agent saves in its
+# outbox/ subfolder during a turn are sent back to the chat.
+CONVERSATIONS_FOLDER_NAME = "telegram_sessions"
+OUTBOX_FOLDER_NAME = "outbox"
+# Telegram delivers a multi-file drop (album or several documents) as separate
+# messages; wait this long after the last one before acknowledging the batch.
+ATTACHMENT_BATCH_SECONDS = float(os.environ.get("TELEGRAM_ATTACHMENT_BATCH_SECONDS", "1.8"))
+# Maps agent thread ids to their conversation folder so /resume keeps using it.
+CONVERSATION_STATE_FILE = Path(
+    os.environ.get(
+        "TELEGRAM_CONVERSATION_STATE",
+        str(Path(__file__).resolve().parent / "conversation_state.json"),
+    )
+)
+CONVERSATION_STATE_MAX_ENTRIES = 500
+STEER_TIMEOUT = 20
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 MEMORY_GUARD_INTERVAL = 2
-ATTACHMENT_PROMPT = (
-    "i have sent you attachments in the folder attachment that have been dropped less than a minute ago."
-)
-OUTBOUND_FILE_PROMPT = (
-    "If you create a file for me to download, save it in the attachment/ folder "
-    "inside the workspace; it will be sent to me as a Telegram document after you finish."
-)
 BACKGROUND_TASK_STOP_TIMEOUT = 5
 TELEGRAM_PROGRESS_TIMEOUT = 15
 TELEGRAM_CLEANUP_TIMEOUT = 5
@@ -433,17 +443,98 @@ async def send_document(chat_id, path, caption=None, message_thread_id=None):
     )
 
 
-def attachment_folder_for_thread(session_thread_id=None):
-    folder = Path(WORKSPACE) / ATTACHMENT_FOLDER_NAME
-    if session_thread_id is not None:
-        folder = folder / "telegram_topics" / str(session_thread_id)
-    return folder
+def session_folder_key(session_key):
+    """Return a stable folder name for one chat or forum topic."""
+    chat_id, thread_id = session_key
+    if thread_id is not None:
+        return f"topic-{thread_id}"
+    return f"chat-{str(chat_id).lstrip('-')}"
 
 
-def attachment_file_snapshot(folder=None):
-    """Snapshot regular files in the exchange folder before a Codex turn."""
-    folder = Path(folder) if folder is not None else attachment_folder_for_thread()
-    if not folder.is_dir():
+def folder_slug(name, max_length=40):
+    """Turn an optional conversation name into a short, readable folder suffix."""
+    value = re.sub(r"[^\w-]+", "-", str(name or "").strip().lower(), flags=re.UNICODE)
+    value = re.sub(r"-{2,}", "-", value).strip("-_")
+    return value[:max_length].rstrip("-_")
+
+
+def conversations_root():
+    return Path(WORKSPACE) / CONVERSATIONS_FOLDER_NAME
+
+
+_ASSIGNED_CONVERSATION_FOLDERS = set()
+
+
+def new_conversation_folder(session_key, name=None, now=None):
+    """Choose (but do not create) a unique folder for a new conversation."""
+    base = conversations_root() / session_folder_key(session_key)
+    stem = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    slug = folder_slug(name)
+    if slug:
+        stem = f"{stem}-{slug}"
+    candidate = base / stem
+    suffix = 2
+    while candidate.exists() or candidate in _ASSIGNED_CONVERSATION_FOLDERS:
+        candidate = base / f"{stem}-{suffix}"
+        suffix += 1
+    _ASSIGNED_CONVERSATION_FOLDERS.add(candidate)
+    return candidate
+
+
+def outbox_folder(conversation_folder):
+    return Path(conversation_folder) / OUTBOX_FOLDER_NAME
+
+
+def is_within(path, parent):
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def load_conversation_state():
+    try:
+        state = json.loads(CONVERSATION_STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {"threads": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("threads"), dict):
+        return {"threads": {}}
+    return state
+
+
+def remember_thread_conversation(thread_id, folder, cwd):
+    """Persist thread -> conversation folder so /resume reuses the same folder."""
+    if not thread_id or not folder:
+        return
+    entry = {"folder": str(folder), "cwd": str(cwd) if cwd else None}
+    state = load_conversation_state()
+    threads = state["threads"]
+    if {key: threads.get(thread_id, {}).get(key) for key in entry} == entry:
+        return
+    threads.pop(thread_id, None)
+    threads[thread_id] = {**entry, "updatedAt": int(time.time())}
+    while len(threads) > CONVERSATION_STATE_MAX_ENTRIES:
+        threads.pop(next(iter(threads)))
+    temporary = CONVERSATION_STATE_FILE.with_name(CONVERSATION_STATE_FILE.name + ".tmp")
+    try:
+        CONVERSATION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(state, indent=1))
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, CONVERSATION_STATE_FILE)
+    except OSError as error:
+        LOG.warning("Could not save conversation state: %s", error)
+
+
+def thread_conversation_record(thread_id):
+    record = load_conversation_state()["threads"].get(thread_id)
+    return record if isinstance(record, dict) and record.get("folder") else None
+
+
+def attachment_file_snapshot(folder):
+    """Snapshot regular files in an outbound folder before an agent turn."""
+    folder = Path(folder) if folder is not None else None
+    if folder is None or not folder.is_dir():
         return {}
 
     snapshot = {}
@@ -458,8 +549,8 @@ def attachment_file_snapshot(folder=None):
     return snapshot
 
 
-def changed_attachment_files(before, folder=None):
-    """Return files created or changed in attachment/ during the turn."""
+def changed_attachment_files(before, folder):
+    """Return files created or changed in the outbound folder during the turn."""
     after = attachment_file_snapshot(folder)
     changed = [path for path, state in after.items() if before.get(path) != state]
     return sorted(changed, key=lambda path: str(path))
@@ -471,6 +562,36 @@ def safe_attachment_name(name, fallback):
     value = re.sub(r"[\x00-\x1f\x7f]+", "_", value)
     value = re.sub(r"[^A-Za-z0-9._() -]", "_", value).strip(" .")
     return (value[:120] or fallback)
+
+
+def readable_attachment_name(name, fallback):
+    """Like safe_attachment_name, but keep accented and non-Latin letters."""
+    value = Path(str(name or "").replace("\\", "/")).name
+    value = re.sub(r"[\x00-\x1f\x7f]+", "_", value)
+    value = re.sub(r"[^\w.,()\[\]+@&' -]", "_", value, flags=re.UNICODE).strip(" .")
+    if len(value) > 120:
+        stem, dot, suffix = value.rpartition(".")
+        if dot and 0 < len(suffix) <= 10:
+            value = f"{stem[:119 - len(suffix)].rstrip()}.{suffix}"
+        else:
+            value = value[:120]
+    return value or fallback
+
+
+def reserve_attachment_path(folder, filename):
+    """Create an empty file named like the upload, adding ' (2)' etc. on clashes."""
+    candidate = Path(filename)
+    stem, suffix = candidate.stem, candidate.suffix
+    counter = 1
+    while True:
+        name = filename if counter == 1 else f"{stem} ({counter}){suffix}"
+        destination = Path(folder) / name
+        try:
+            with destination.open("xb"):
+                pass
+            return destination
+        except FileExistsError:
+            counter += 1
 
 
 def attachment_specs(message):
@@ -511,29 +632,30 @@ def attachment_specs(message):
     return specs
 
 
-async def save_attachments(message, folder=None):
-    """Download all files from one Telegram message into workspace/attachment."""
+MEDIA_FIELDS = ("document", "photo", "audio", "video", "animation", "voice", "video_note", "sticker")
+
+
+async def save_attachments(message, folder):
+    """Download all files from one Telegram message into a conversation folder."""
     specs = attachment_specs(message)
     if not specs:
         return []
 
-    attachment_folder = Path(folder) if folder is not None else attachment_folder_for_thread()
+    attachment_folder = Path(folder)
     attachment_folder.mkdir(parents=True, exist_ok=True)
-    message_id = str(message.get("message_id", "unknown"))
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     saved_paths = []
 
     try:
         for index, spec in enumerate(specs, 1):
-            filename = safe_attachment_name(
+            filename = readable_attachment_name(
                 spec["name"],
                 f"{spec['kind']}_{index}",
             )
-            destination = attachment_folder / f"{timestamp}_{message_id}_{index}_{filename}"
             file_info = await telegram("getFile", {"file_id": spec["file_id"]})
             file_path = file_info.get("file_path") if isinstance(file_info, dict) else None
             if not file_path:
                 raise RuntimeError(f"Telegram did not return a file path for {filename}")
+            destination = reserve_attachment_path(attachment_folder, filename)
             try:
                 await asyncio.to_thread(telegram_file_download, file_path, destination)
             except Exception:
@@ -552,28 +674,51 @@ async def save_attachments(message, folder=None):
 
 
 def prompt_with_attachments(text, paths):
-    """Tell Codex exactly where this message's fresh attachments were placed."""
-    relative_paths = []
-    workspace = Path(WORKSPACE)
-    for path in paths:
-        try:
-            relative_paths.append(str(path.relative_to(workspace)))
-        except ValueError:
-            relative_paths.append(str(path))
-
-    files = "\n".join(f"- {path}" for path in relative_paths)
-    attachment_context = (
-        f"{ATTACHMENT_PROMPT}\n"
-        "Only inspect files from this message that were modified less than one minute ago; "
-        "ignore older files in that folder.\n"
-        f"Files from this message:\n{files}"
-    )
+    """List the exact files the user attached for this prompt."""
+    paths = [Path(path) for path in paths or []]
     text = (text or "").strip()
-    return f"{text}\n\n{attachment_context}".strip()
+    if not paths:
+        return text
+    files = "\n".join(f"- {path.name}: {path}" for path in paths)
+    noun = "file" if len(paths) == 1 else f"{len(paths)} files"
+    attachment_context = (
+        f"I attached {noun} for this message. They are saved on disk at these exact "
+        f"absolute paths:\n{files}"
+    )
+    if not text:
+        text = "Please look at the attached files."
+    return f"{text}\n\n{attachment_context}"
+
+
+def format_file_names(paths, limit=10):
+    names = [Path(path).name for path in paths]
+    shown = ", ".join(names[:limit])
+    if len(names) > limit:
+        shown += f" and {len(names) - limit} more"
+    return shown
+
+
+def attachment_ack_text(saved, pending_total, folder, task_running):
+    count = len(saved)
+    noun = "file" if count == 1 else "files"
+    lines = [
+        f"📎 Saved {count} {noun} to this conversation: {format_file_names(saved)}",
+        f"Folder: {folder}",
+    ]
+    if pending_total > count:
+        lines.append(f"{pending_total} files are now waiting for your next message.")
+    if task_running:
+        lines.append(
+            "A task is still running: your next message will be added to it "
+            "together with these files."
+        )
+    else:
+        lines.append("Send your instructions when ready.")
+    return "\n".join(lines)
 
 
 def clean_telegram_text(text, citation_sources=None):
-    """Turn Codex citation markers into links or remove unresolved markers."""
+    """Turn agent citation markers into links or remove unresolved markers."""
     citation_sources = citation_sources or {}
 
     def replace_citation(match):
@@ -599,10 +744,10 @@ def clean_telegram_text(text, citation_sources=None):
 
 
 def telegram_html(text, citation_sources=None):
-    """Convert the small Markdown subset used by Codex into Telegram HTML."""
+    """Convert the small Markdown subset used by the agent into Telegram HTML."""
     text = clean_telegram_text(text, citation_sources)
     if not text:
-        return html.escape("(Codex returned an empty response.)")
+        return html.escape("(The agent returned an empty response.)")
 
     protected = []
 
@@ -653,7 +798,7 @@ def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
     if limit < 1:
         raise ValueError("Message chunk limit must be positive")
 
-    text = text or "(Codex returned an empty response.)"
+    text = text or "(The agent returned an empty response.)"
     return [text[start:start + limit] for start in range(0, len(text), limit)]
 
 
@@ -763,26 +908,36 @@ async def typing_loop(chat_id, message_thread_id=None):
         pass
 
 
+def outbound_file_prompt(output_folder):
+    return (
+        "If you create a file for me to download, save it (or a copy) in "
+        f"`{output_folder}/` (create the folder if needed); every new or changed "
+        "file there is sent to me as a Telegram document after you finish."
+    )
+
+
+def backend_name(backend):
+    return getattr(backend, "display_name", None) or "The agent"
+
+
 async def run_prompt_with_progress(
     codex,
     prompt,
     target_chat_id,
     message_thread_id=None,
-    session_thread_id=None,
+    output_folder=None,
 ):
-    """Run one turn and make completion independent of Telegram UI cleanup."""
-    output_folder = attachment_folder_for_thread(session_thread_id)
-    if session_thread_id is not None:
-        output_folder.mkdir(parents=True, exist_ok=True)
+    """Run one turn and make completion independent of Telegram UI cleanup.
+
+    ``codex`` is the conversation's agent backend. ``output_folder`` is the
+    conversation's outbox: files created or changed there during the turn are
+    sent back to the chat afterwards.
+    """
+    agent_name = backend_name(codex)
     files_before_turn = attachment_file_snapshot(output_folder)
-    codex_prompt = f"{prompt.rstrip()}\n\n{OUTBOUND_FILE_PROMPT}".strip()
-    if session_thread_id is not None:
-        relative_output_folder = output_folder.relative_to(Path(WORKSPACE))
-        codex_prompt += (
-            f"\n\nFor this Telegram topic, save downloadable files in "
-            f"`{relative_output_folder}/`; files in that folder are sent back "
-            "to this topic."
-        )
+    codex_prompt = prompt.rstrip()
+    if output_folder is not None:
+        codex_prompt = f"{codex_prompt}\n\n{outbound_file_prompt(output_folder)}".strip()
     if message_thread_id is None:
         typing_task = asyncio.create_task(typing_loop(target_chat_id))
     else:
@@ -818,7 +973,7 @@ async def run_prompt_with_progress(
                 if not progress_state["active"] or update == last_update:
                     continue
 
-                text = f"Codex is working…\n\nLatest progress:\n{update}"
+                text = f"{agent_name} is working…\n\nLatest progress:\n{update}"
                 try:
                     if progress_message["id"] is None:
                         async def send_initial_progress():
@@ -886,7 +1041,7 @@ async def run_prompt_with_progress(
             response = await codex.run(codex_prompt, title_prompt=prompt)
             turn_succeeded = True
         except Exception as error:
-            response = f"Codex error: {error}\n\nSend /new and try again."
+            response = f"{agent_name} error: {error}\n\nSend /new and try again."
         finally:
             # Stop both UI indicators immediately after the app-server turn
             # resolves. Final response delivery must not keep them alive.
@@ -906,13 +1061,13 @@ async def run_prompt_with_progress(
         try:
             await send_thread_message(response, codex.citation_sources)
         except Exception as error:
-            LOG.warning("Could not deliver Codex response: %s", error)
+            LOG.warning("Could not deliver the agent response: %s", error)
             try:
                 await send_thread_message(f"Telegram delivery error: {error}")
             except Exception as notify_error:
                 LOG.warning("Could not deliver Telegram error message: %s", notify_error)
 
-        if turn_succeeded:
+        if turn_succeeded and output_folder is not None:
             outbound_files = changed_attachment_files(files_before_turn, output_folder)
             for path in outbound_files:
                 try:
@@ -1030,6 +1185,15 @@ def telegram_session_key(message):
 
 
 class CodexAppServer:
+    """Codex backend: one `codex app-server` process per Telegram session.
+
+    The Telegram layer only relies on the attributes and methods listed in
+    BACKEND_REQUIRED (plus OPTIONAL_COMMAND_ATTRIBUTES), so another agent
+    backend can be swapped in.
+    """
+
+    display_name = "Codex"
+
     def __init__(self):
         self.process = None
         self.reader_task = None
@@ -1039,6 +1203,8 @@ class CodexAppServer:
         self.completed_turns = {}
         self.turn_messages = {}
         self.thread_id = None
+        self.cwd = WORKSPACE
+        self.thread_has_started_turn = False
         self.thread_has_completed_turn = False
         self.pending_thread_name = None
         self.needs_auto_thread_name = False
@@ -1161,6 +1327,9 @@ class CodexAppServer:
 
                 if request_id is not None and request_id in self.pending:
                     future = self.pending.pop(request_id)
+                    if future.done():
+                        # The caller stopped waiting (for example a timeout).
+                        continue
                     if "error" in message:
                         future.set_exception(
                             RuntimeError(message["error"].get("message", str(message["error"])))
@@ -1239,9 +1408,26 @@ class CodexAppServer:
                             }
                         )
 
+                elif method == "turn/started":
+                    # Track the running turn as early as possible so new
+                    # Telegram messages can steer it.
+                    turn_id = (params.get("turn") or {}).get("id")
+                    if (
+                        turn_id
+                        and self.thread_id
+                        and params.get("threadId") == self.thread_id
+                        and not self.active_turn_id
+                    ):
+                        self.active_turn_id = turn_id
+                        self.active_turn_thread_id = self.thread_id
+
                 elif method == "turn/completed":
                     turn = params.get("turn", {})
                     turn_id = turn.get("id")
+                    if turn_id and turn_id == self.active_turn_id and turn_id not in self.turn_waiters:
+                        # A turn nobody waits for (e.g. started by the server).
+                        self.active_turn_id = None
+                        self.active_turn_thread_id = None
                     waiter = self.turn_waiters.pop(turn_id, None)
                     if waiter and not waiter.done():
                         waiter.set_result(turn)
@@ -1313,15 +1499,26 @@ class CodexAppServer:
         self.last_thread_name = None
         self.token_usage = None
 
-    async def new_thread(self, name=None):
+    async def new_thread(self, name=None, cwd=None):
+        """Start a fresh conversation whose turns run in ``cwd`` (default: workspace).
+
+        An untouched thread with the same working directory is reused, which
+        keeps /new fast.
+        """
+        cwd = str(cwd or WORKSPACE)
+        if self.thread_id and not self.thread_has_started_turn and cwd == self.cwd:
+            self.configure_new_thread_state(name)
+            return
         params = {
             "model": self.current_model,
-            "cwd": WORKSPACE,
+            "cwd": cwd,
             "serviceName": "telegram_codex_bot",
         }
         params.update(self.thread_permission_params())
         result = await self.request("thread/start", params)
         self.thread_id = result["thread"]["id"]
+        self.cwd = cwd
+        self.thread_has_started_turn = False
         self.configure_new_thread_state(name)
 
     @staticmethod
@@ -1459,6 +1656,10 @@ class CodexAppServer:
         )
         thread = result["thread"]
         self.thread_id = thread["id"]
+        # Keep the historical behaviour (turns run in the workspace); the
+        # Telegram layer restores a conversation folder cwd when it knows one.
+        self.cwd = WORKSPACE
+        self.thread_has_started_turn = True
         self.thread_has_completed_turn = True
         self.pending_thread_name = None
         self.needs_auto_thread_name = False
@@ -1636,6 +1837,7 @@ class CodexAppServer:
 
     async def run(self, prompt, title_prompt=None):
         self.last_thread_name = None
+        self.thread_has_started_turn = True
         response = await self.run_thread_turn(
             self.thread_id,
             self.turn_start_params(prompt),
@@ -1672,15 +1874,37 @@ class CodexAppServer:
         params = {
             "threadId": self.thread_id,
             "input": [{"type": "text", "text": prompt}],
-            "cwd": WORKSPACE,
+            "cwd": self.cwd,
             "model": self.current_model,
             "effort": self.current_effort,
             "serviceTier": FAST_SERVICE_TIER if self.fast_mode else None,
         }
         params.update(self.turn_permission_params())
         if self.permission_mode in {"ask", "approve"}:
-            params["sandboxPolicy"]["writableRoots"] = [WORKSPACE]
+            writable_roots = [WORKSPACE]
+            if not is_within(self.cwd, WORKSPACE):
+                writable_roots.append(self.cwd)
+            params["sandboxPolicy"]["writableRoots"] = writable_roots
         return params
+
+    async def steer(self, prompt):
+        """Add a user message to the turn that is currently running.
+
+        Raises when there is no steerable turn (none running, it just ended,
+        or it is a review/compaction turn); callers then queue the message.
+        """
+        turn_id = self.active_turn_id
+        if not turn_id or not self.thread_id or self.active_turn_thread_id != self.thread_id:
+            raise RuntimeError("no active turn to steer")
+        result = await self.request(
+            "turn/steer",
+            {
+                "threadId": self.thread_id,
+                "input": [{"type": "text", "text": prompt}],
+                "expectedTurnId": turn_id,
+            },
+        )
+        return (result or {}).get("turnId") or turn_id
 
     async def interrupt(self):
         if not self.active_turn_id:
@@ -1768,31 +1992,137 @@ class CodexAppServer:
         return "\n".join(lines)
 
 
+DEFAULT_PROVIDER = "codex"
+PROVIDER_LABELS = {"codex": "Codex"}
+
+# What the Telegram layer (handle_update, run_conversation,
+# run_prompt_with_progress, monitor_cgroup_oom) uses from session["codex"].
+# Any backend providing these can replace CodexAppServer for a session.
+BACKEND_REQUIRED = (
+    # lifecycle
+    "start",  # async (): start the backend and open a first conversation
+    "close",  # async (): stop it
+    # conversation
+    "thread_id",  # str | None: current conversation id (persisted for /resume)
+    "cwd",  # str: working directory of the next turn (read/write)
+    "new_thread",  # async (name=None, cwd=None): fresh conversation in cwd (default WORKSPACE)
+    "pending_thread_name",  # str | None: name requested with /new NAME, applied later
+    "last_thread_name",  # str | None: title chosen by the last run (renames the topic)
+    "set_thread_name",  # async (name) -> bool applied now (False: after first turn)
+    "normalize_thread_name",  # (name) -> str
+    # turns
+    "run",  # async (prompt, title_prompt=None) -> final text; raises on failure
+    "steer",  # async (prompt): add input to the running turn; raise if impossible
+    "interrupt",  # async () -> bool: stop the running turn
+    "active_turn_id",  # truthy while a turn runs
+    "progress_updates",  # asyncio.Queue[str] of progress lines during a run
+    "citation_sources",  # dict for clean_telegram_text links ({} is fine)
+    # resume and status
+    "list_threads",  # async () -> [{"id", "name"?, "preview"?, "updatedAt"?, "createdAt"?}]
+    "resume_choices",  # list filled by list_threads
+    "resume_thread",  # async (thread_id) -> {"id", "cwd"?, ...}; sets thread_id
+    "resume_confirmation",  # async (resumed, listed_thread) -> str
+    "status_text",  # async () -> str
+    "current_model",  # str: shown in /new and /model replies
+    "current_effort",  # str | None
+)
+# Optional commands: hidden behind the backend attribute named here.
+OPTIONAL_COMMAND_ATTRIBUTES = {
+    "/model": "refresh_models",  # + models, current_model, current_effort
+    "/think": "supported_efforts",
+    "/thinking": "supported_efforts",
+    "/reasoning": "supported_efforts",
+    "/fast": "fast_mode",
+    "/permissions": "set_permission_mode",  # + permission_mode, permission_summary()
+    "/permission": "set_permission_mode",
+    "/compact": "compact_thread",
+    "/compact_context": "compact_thread",
+    "/goal": "get_goal",  # + set_goal, clear_goal
+    "/goals": "get_goal",
+}
+
+
+def create_backend(provider=DEFAULT_PROVIDER):
+    """Return an unstarted agent backend for a provider name."""
+    if provider == "codex":
+        return CodexAppServer()
+    raise ValueError(f"Unknown agent provider: {provider}")
+
+
+def new_conversation(session_key, name=None, folder=None, prompted=False):
+    return {
+        "folder": Path(folder) if folder else new_conversation_folder(session_key, name),
+        # True once a prompt was sent (or the conversation was resumed).
+        "prompted": prompted,
+        # True when the conversation was opened by a file drop.
+        "files_first": False,
+    }
+
+
+def conversation_status(session):
+    conversation = session["conversation"]
+    folder = conversation["folder"]
+    created = "" if Path(folder).is_dir() else " (not created yet)"
+    lines = [
+        f"Conversation folder: {folder}{created}",
+        f"Working directory: {getattr(session['codex'], 'cwd', WORKSPACE)}",
+        f"Files waiting for your next message: {len(session['pending_attachments'])}",
+        f"Queued messages: {len(session['queued_prompts'])}",
+    ]
+    return "\n".join(lines)
+
+
 async def main():
     offset = 0
     sessions = {}
     update_tasks = {}
 
-    async def create_session():
-        codex = CodexAppServer()
-        await codex.start()
+    def enqueue(key, work):
+        """Run work() after every earlier update of the same chat topic."""
+        previous = update_tasks.get(key)
+
+        async def dispatch():
+            if previous:
+                try:
+                    await previous
+                except Exception:
+                    LOG.exception("Previous Telegram update failed")
+            try:
+                await work()
+            except Exception:
+                LOG.exception("Telegram update failed")
+            finally:
+                if update_tasks.get(key) is asyncio.current_task():
+                    update_tasks.pop(key, None)
+
+        task = asyncio.create_task(dispatch())
+        update_tasks[key] = task
+        return task
+
+    async def create_session(session_key, provider=DEFAULT_PROVIDER):
+        backend = create_backend(provider)
+        await backend.start()
         return {
-            "codex": codex,
+            "codex": backend,
+            "provider": provider,
             "running_task": None,
             "pending_selection": None,
+            "conversation": new_conversation(session_key),
+            # Saved uploads not yet handed to the agent; the next prompt takes them all.
+            "pending_attachments": [],
+            # Prompts that could not steer the running turn; run next, in order.
+            "queued_prompts": [],
+            # Debounce state for one multi-file drop (one acknowledgement per burst).
+            "attachment_batch": {
+                "files": [],
+                "captions": [],
+                "timer": None,
+                "generation": 0,
+                "target": None,
+            },
         }
 
-    async def handle_update(update):
-        message = update.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-
-        if chat_id != ALLOWED_CHAT_ID:
-            return
-
-        message_thread_id = message.get("message_thread_id")
-        session_key = telegram_session_key(message)
-        session_thread_id = session_key[1]
-
+    def make_reply(chat_id, message_thread_id):
         async def reply(text, citation_sources=None):
             if message_thread_id is None:
                 return await send_message(chat_id, text, citation_sources)
@@ -1803,9 +2133,215 @@ async def main():
                 message_thread_id=message_thread_id,
             )
 
-        attachment_messages = attachment_specs(message)
+        return reply
+
+    def task_running(session):
+        task = session["running_task"]
+        return task is not None and not task.done()
+
+    def reset_attachment_batch(session):
+        """Forget the current file burst (no acknowledgement); return its captions."""
+        batch = session["attachment_batch"]
+        if batch["timer"] and not batch["timer"].done():
+            batch["timer"].cancel()
+        captions = batch["captions"]
+        batch.update(files=[], captions=[], timer=None)
+        batch["generation"] += 1
+        return captions
+
+    def start_conversation(session, session_key, name=None, folder=None, prompted=False):
+        reset_attachment_batch(session)
+        session["pending_attachments"] = []
+        session["queued_prompts"] = []
+        session["conversation"] = new_conversation(
+            session_key, name=name, folder=folder, prompted=prompted
+        )
+
+    def arm_attachment_batch(session, session_key):
+        """(Re)start the quiet-period timer that ends a multi-file drop."""
+        batch = session["attachment_batch"]
+        if batch["timer"] and not batch["timer"].done():
+            batch["timer"].cancel()
+        batch["generation"] += 1
+        generation = batch["generation"]
+
+        async def wait_then_flush():
+            await asyncio.sleep(ATTACHMENT_BATCH_SECONDS)
+            # Go through the per-topic queue so the flush is ordered with updates.
+            enqueue(session_key, lambda: flush_attachment_batch(session_key, generation))
+
+        batch["timer"] = asyncio.create_task(wait_then_flush())
+
+    async def flush_attachment_batch(session_key, generation):
+        session = sessions.get(session_key)
+        if session is None:
+            return
+        batch = session["attachment_batch"]
+        if batch["generation"] != generation or not batch["target"]:
+            return
+        chat_id, message_thread_id = batch["target"]
+        reply = make_reply(chat_id, message_thread_id)
+        if batch["captions"]:
+            # Files sent with a caption: the caption is the prompt for all of them.
+            await submit_prompt(session, "", chat_id, message_thread_id, reply)
+            return
+        files = list(batch["files"])
+        reset_attachment_batch(session)
+        if files:
+            await reply(
+                attachment_ack_text(
+                    files,
+                    len(session["pending_attachments"]),
+                    session["conversation"]["folder"],
+                    task_running(session),
+                )
+            )
+
+    async def run_conversation(session, prompt, chat_id, message_thread_id):
+        """Run a prompt, then any messages queued while it was running."""
+        backend = session["codex"]
+        while True:
+            conversation = session["conversation"]
+            try:
+                remember_thread_conversation(backend.thread_id, conversation["folder"], backend.cwd)
+                await run_prompt_with_progress(
+                    backend,
+                    prompt,
+                    chat_id,
+                    message_thread_id,
+                    outbox_folder(conversation["folder"]),
+                )
+                remember_thread_conversation(backend.thread_id, conversation["folder"], backend.cwd)
+            except Exception:
+                # Keep going so queued messages are never stranded.
+                LOG.exception("Agent run failed")
+            # No await between this check and returning: a message that fails
+            # to steer either lands in the queue before it, or sees the task done.
+            if not session["queued_prompts"]:
+                return
+            prompt = "\n\n".join(session["queued_prompts"])
+            session["queued_prompts"].clear()
+
+    async def submit_prompt(session, text, chat_id, message_thread_id, reply):
+        """Send a user prompt (plus every pending file) to the agent.
+
+        Starts a run when idle; otherwise steers the running turn, and when
+        that is not possible queues the prompt to run right after it.
+        """
+        captions = reset_attachment_batch(session)
+        text = "\n\n".join(part for part in [*captions, (text or "").strip()] if part)
+        files = session["pending_attachments"]
+        session["pending_attachments"] = []
+        prompt = prompt_with_attachments(text, files)
+        session["conversation"]["prompted"] = True
+        backend = session["codex"]
+
+        if task_running(session):
+            try:
+                await asyncio.wait_for(backend.steer(prompt), STEER_TIMEOUT)
+            except Exception as error:
+                LOG.info("Could not steer the running task (%s); queueing the message", error)
+            else:
+                count = len(files)
+                note = f" ({count} file{'' if count == 1 else 's'} included)" if count else ""
+                await reply(f"↪️ Added to the running task{note}.")
+                return
+            if task_running(session):
+                session["queued_prompts"].append(prompt)
+                await reply(
+                    "⏳ Queued: the running task could not take new input, so your "
+                    "message will be sent as soon as it finishes."
+                )
+                return
+
+        session["running_task"] = asyncio.create_task(
+            run_conversation(session, prompt, chat_id, message_thread_id)
+        )
+
+    async def handle_attachments(session, session_key, message, text, chat_id, message_thread_id, reply):
+        """Save uploads as pending files; never start a run by themselves."""
+        backend = session["codex"]
+        conversation = session["conversation"]
+        batch = session["attachment_batch"]
+        try:
+            try:
+                saved = await save_attachments(message, conversation["folder"])
+            except Exception as error:
+                LOG.warning("Could not save Telegram attachments: %s", error)
+                await reply(f"Could not save the Telegram attachment(s): {error}")
+                return
+            session["pending_attachments"].extend(saved)
+            batch["files"].extend(saved)
+            if text.strip():
+                batch["captions"].append(text.strip())
+            batch["target"] = (chat_id, message_thread_id)
+
+            if (
+                not conversation["prompted"]
+                and not conversation["files_first"]
+                and not task_running(session)
+            ):
+                # A conversation that starts with a file drop works in the
+                # folder that holds those files.
+                conversation["files_first"] = True
+                try:
+                    await backend.new_thread(
+                        backend.pending_thread_name,
+                        cwd=str(conversation["folder"]),
+                    )
+                    remember_thread_conversation(
+                        backend.thread_id, conversation["folder"], backend.cwd
+                    )
+                except Exception as error:
+                    LOG.warning(
+                        "Could not open the conversation in %s: %s",
+                        conversation["folder"],
+                        error,
+                    )
+        finally:
+            if batch["files"] or batch["captions"]:
+                arm_attachment_batch(session, session_key)
+
+    async def resume_conversation(session, session_key, selected_thread, reply):
+        codex = session["codex"]
+        try:
+            resumed = await codex.resume_thread(selected_thread["id"])
+        except Exception as error:
+            await reply(f"Could not resume conversation: {error}")
+            return
+
+        thread_id = resumed.get("id") or selected_thread["id"]
+        record = thread_conversation_record(thread_id)
+        thread_cwd = resumed.get("cwd")
+        if record:
+            folder = Path(record["folder"])
+            cwd = record.get("cwd")
+        elif thread_cwd and is_within(thread_cwd, conversations_root()):
+            folder = Path(thread_cwd)
+            cwd = thread_cwd
+        else:
+            folder = new_conversation_folder(session_key, "resumed")
+            cwd = None
+        if cwd and Path(cwd).is_dir():
+            codex.cwd = str(cwd)
+        start_conversation(session, session_key, folder=folder, prompted=True)
+        remember_thread_conversation(codex.thread_id, folder, codex.cwd)
+        await reply(await codex.resume_confirmation(resumed, selected_thread))
+
+    async def handle_update(update):
+        message = update.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+
+        if chat_id != ALLOWED_CHAT_ID:
+            return
+
+        message_thread_id = message.get("message_thread_id")
+        session_key = telegram_session_key(message)
+        reply = make_reply(chat_id, message_thread_id)
+
+        has_files = bool(attachment_specs(message))
         text = message.get("text") or message.get("caption") or ""
-        if not text and not attachment_messages:
+        if not text and not has_files:
             if any(
                 key in message
                 for key in (
@@ -1816,7 +2352,7 @@ async def main():
                 )
             ):
                 return
-            await reply("For now, send me a text message.")
+            await reply("For now, send me a text message or a file.")
             return
 
         parts = text.strip().split()
@@ -1824,13 +2360,19 @@ async def main():
         argument = parts[1] if len(parts) > 1 else None
         argument_text = " ".join(parts[1:])
 
+        if has_files and command.startswith("/"):
+            # A file captioned with a command (e.g. /new): run the command,
+            # then keep the files in the resulting conversation.
+            without_files = {key: value for key, value in message.items() if key not in MEDIA_FIELDS}
+            files_only = {
+                key: value for key, value in message.items() if key not in {"caption", "text"}
+            }
+            await handle_update({**update, "message": without_files})
+            await handle_update({**update, "message": files_only})
+            return
+
         session = sessions.get(session_key)
-        if (
-            command == "/new"
-            and session is not None
-            and session["running_task"]
-            and not session["running_task"].done()
-        ):
+        if command == "/new" and session is not None and task_running(session):
             await reply("Stop the current task with /stop first.")
             return
         if command == "/new":
@@ -1838,12 +2380,27 @@ async def main():
 
         if session is None:
             try:
-                session = await create_session()
+                session = await create_session(session_key)
                 sessions[session_key] = session
             except Exception as error:
-                await reply(f"Could not start Codex for this topic: {error}")
+                label = PROVIDER_LABELS.get(DEFAULT_PROVIDER, "the agent")
+                await reply(f"Could not start {label} for this topic: {error}")
                 return
         codex = session["codex"]
+
+        if has_files:
+            session["pending_selection"] = None
+            await handle_attachments(
+                session, session_key, message, text, chat_id, message_thread_id, reply
+            )
+            return
+
+        if command in OPTIONAL_COMMAND_ATTRIBUTES and not hasattr(
+            codex, OPTIONAL_COMMAND_ATTRIBUTES[command]
+        ):
+            session["pending_selection"] = None
+            await reply(f"{command} is not available with {backend_name(codex)}.")
+            return
 
         if command.startswith("/"):
             session["pending_selection"] = None
@@ -1898,20 +2455,19 @@ async def main():
                 selected_thread = numbered_choice(selection, pending["options"])
                 if selected_thread is None:
                     await reply("Choose one of the numbered conversations.")
+                elif task_running(session):
+                    await reply("Stop the current task with /stop first.")
                 else:
-                    try:
-                        resumed = await codex.resume_thread(selected_thread["id"])
-                    except Exception as error:
-                        await reply(f"Could not resume conversation: {error}")
-                    else:
-                        await reply(
-                            await codex.resume_confirmation(resumed, selected_thread)
-                        )
+                    await resume_conversation(session, session_key, selected_thread, reply)
                 return
 
         if command in ("/start", "/help"):
             await reply(
-                "Codex is connected.\n\n"
+                f"{backend_name(codex)} is connected.\n\n"
+                "Send a message to start a task. Messages sent while a task is "
+                "running are added to it.\n"
+                "Send files without text to stage them: they are saved in this "
+                "conversation's own folder and included with your next message.\n\n"
                 "/model — list models\n"
                 "/model MODEL_ID — select a model\n"
                 "/think — list thinking levels\n"
@@ -1923,11 +2479,11 @@ async def main():
                 "/goal — show the current goal\n"
                 "/goal OBJECTIVE — set a durable goal\n"
                 "/goal clear — remove the current goal\n"
-                "/status, /usage, or /debug — live task and last event\n"
-                "/stop — stop the current task\n"
+                "/status, /usage, or /debug — live task, last event, conversation folder\n"
+                "/stop — stop the current task (and drop queued messages)\n"
                 "/resume — list recent conversations\n"
                 "/resume NUMBER — resume it and show its last AI response\n"
-                "/new [NAME] — start a fresh conversation; auto-name it if NAME is omitted\n"
+                "/new [NAME] — start a fresh conversation and folder; auto-name it if NAME is omitted\n"
                 "/rename NAME — rename the current conversation",
             )
             return
@@ -1941,7 +2497,7 @@ async def main():
             return
 
         if command in {"/permissions", "/permission"}:
-            if session["running_task"] and not session["running_task"].done():
+            if task_running(session):
                 await reply("Stop the current task before changing permissions.")
                 return
 
@@ -1972,7 +2528,7 @@ async def main():
             return
 
         if command in {"/compact", "/compact_context"}:
-            if session["running_task"] and not session["running_task"].done():
+            if task_running(session):
                 await reply("Stop the current task before compacting context.")
                 return
             await reply("Compacting the current context...")
@@ -1984,7 +2540,7 @@ async def main():
             return
 
         if command in {"/goal", "/goals"}:
-            if session["running_task"] and not session["running_task"].done():
+            if task_running(session):
                 await reply("Stop the current task before changing its goal.")
                 return
             goal_argument = argument_text.strip()
@@ -2099,34 +2655,40 @@ async def main():
 
         if command in STATUS_COMMANDS:
             try:
-                await reply(await codex.status_text())
+                status = await codex.status_text()
             except Exception as error:
-                await reply(f"Could not read status: {error}")
+                status = f"Could not read status: {error}"
+            await reply(f"{status}\n\n{conversation_status(session)}")
             return
 
         if command == "/stop":
+            dropped = len(session["queued_prompts"])
+            session["queued_prompts"].clear()
+            note = (
+                f"\nDropped {dropped} queued message{'' if dropped == 1 else 's'}."
+                if dropped
+                else ""
+            )
             try:
                 stopped = await codex.interrupt()
                 await reply(
-                    "Stopping the current task..." if stopped else "No task is running.",
+                    ("Stopping the current task..." if stopped else "No task is running.") + note,
                 )
             except Exception as error:
-                await reply(f"Could not stop task: {error}")
+                await reply(f"Could not stop task: {error}{note}")
             return
 
         if command == "/new":
-            if session["running_task"] and not session["running_task"].done():
+            if task_running(session):
                 await reply("Stop the current task with /stop first.")
                 return
             try:
-                if codex.thread_id and not codex.thread_has_completed_turn:
-                    codex.configure_new_thread_state(argument_text or None)
-                else:
-                    await codex.new_thread(argument_text or None)
+                await codex.new_thread(argument_text or None, cwd=WORKSPACE)
             except Exception as error:
-                LOG.exception("Could not start a new Codex conversation")
+                LOG.exception("Could not start a new conversation")
                 await reply(f"Could not start a new conversation: {error}")
                 return
+            start_conversation(session, session_key, name=argument_text or None)
             topic_note = ""
             try:
                 await rename_forum_topic(chat_id, message_thread_id, argument_text or "New conversation")
@@ -2147,7 +2709,7 @@ async def main():
             return
 
         if command == "/rename":
-            if session["running_task"] and not session["running_task"].done():
+            if task_running(session):
                 await reply("Stop the current task with /stop before renaming it.")
                 return
             if not argument_text:
@@ -2182,7 +2744,7 @@ async def main():
             return
 
         if command == "/resume":
-            if session["running_task"] and not session["running_task"].done():
+            if task_running(session):
                 await reply("Stop the current task with /stop first.")
                 return
 
@@ -2225,46 +2787,12 @@ async def main():
                 )
                 return
 
-            selected_thread = codex.resume_choices[selection - 1]
-            try:
-                resumed = await codex.resume_thread(selected_thread["id"])
-            except Exception as error:
-                await reply(f"Could not resume conversation: {error}")
-                return
-            await reply(
-                await codex.resume_confirmation(resumed, selected_thread)
+            await resume_conversation(
+                session, session_key, codex.resume_choices[selection - 1], reply
             )
             return
 
-        if session["running_task"] and not session["running_task"].done():
-            await reply(
-                "Codex is already working. Use /status or /stop.",
-            )
-            return
-
-        if attachment_messages:
-            try:
-                saved_attachments = await save_attachments(
-                    message,
-                    attachment_folder_for_thread(session_thread_id),
-                )
-            except Exception as error:
-                LOG.warning("Could not save Telegram attachments: %s", error)
-                await reply(
-                    f"Could not save the Telegram attachment(s): {error}",
-                )
-                return
-            text = prompt_with_attachments(text, saved_attachments)
-
-        session["running_task"] = asyncio.create_task(
-            run_prompt_with_progress(
-                codex,
-                text,
-                chat_id,
-                message_thread_id,
-                session_thread_id,
-            )
-        )
+        await submit_prompt(session, text, chat_id, message_thread_id, reply)
 
     await telegram("deleteWebhook", {"drop_pending_updates": "false"})
     memory_guard_task = asyncio.create_task(monitor_cgroup_oom(sessions))
@@ -2284,25 +2812,8 @@ async def main():
 
                 for update in updates:
                     offset = update["update_id"] + 1
-                    message = update.get("message", {})
-                    key = telegram_session_key(message)
-                    previous = update_tasks.get(key)
-
-                    async def dispatch(update=update, key=key, previous=previous):
-                        if previous:
-                            try:
-                                await previous
-                            except Exception:
-                                LOG.exception("Previous Telegram update failed")
-                        try:
-                            await handle_update(update)
-                        except Exception:
-                            LOG.exception("Telegram update failed")
-                        finally:
-                            if update_tasks.get(key) is asyncio.current_task():
-                                update_tasks.pop(key, None)
-
-                    update_tasks[key] = asyncio.create_task(dispatch())
+                    key = telegram_session_key(update.get("message", {}))
+                    enqueue(key, lambda update=update: handle_update(update))
 
             except Exception as error:
                 print(f"Polling error: {error}", flush=True)
